@@ -1,0 +1,47 @@
+# --- data (exclude all input documents) ---
+data/
+data/**
+data_unused/
+data_unused/**
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# --- Jupyter (falls vorhanden) ---
+.ipynb_checkpoints/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / outputs ---
+*.log
+prepared.jsonl
+*.jsonl
+.cache/
+.cache/**
+
+# --- IntelliJ / JetBrains ---
+.idea/
+*.iml
+out/
+
+# documents (if you don't want any docs tracked anywhere)
+*.pdf
+*.doc
+*.docx
+*.txt
+*.md
+*.rtf

@@ -1,0 +1,16 @@
+{
+  "queries": [
+    {
+      "id": "q1",
+      "text": "Wie minimiere ich die Kontamination?"
+    },
+    {
+      "id": "q2",
+      "text": "What is the ASTM standard test method about?"
+    },
+    {
+      "id": "q3",
+      "text": "Welches sind die Akzeptanzkriterien beim Nachweis von Kokain oder Heroin?"
+    }
+  ]
+}
