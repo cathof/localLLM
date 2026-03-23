@@ -323,11 +323,20 @@ def make_llm_client() -> LLMClient:
 
 def build_messages(question: str, context: str) -> List[Dict[str, str]]:
     system = (
-        "Du bist ein präziser Assistent. Beantworte die FRAGE ausschliesslich anhand des KONTEXT.\n"
-        "Wenn der KONTEXT nicht ausreicht, sage das explizit und nenne, welche Information fehlt.\n"
-        "Zitiere Aussagen mit [1], [2], ... entsprechend den Kontext-Blöcken."
+        "Du bist ein präziser Assistent für transparente RAG-Antworten.\n"
+        "Beantworte die FRAGE ausschliesslich anhand des KONTEXTS.\n"
+        "Nutze alle relevanten Informationen aus dem KONTEXT möglichst vollständig.\n"
+        "Erfinde nichts und ergänze nichts aus eigenem Wissen.\n"
+        "Strukturiere die Antwort in thematische Schritte oder Phasen.\n"
+        "Jede inhaltliche Aussage muss mit [1], [2], ... belegt werden.\n"
+        "Wenn der KONTEXT nur Teilaspekte enthält, sage klar, welche Teile des Vorgehens fehlen."
     )
-    user = f"FRAGE:\n{question.strip()}\n\nKONTEXT:\n{context}\n"
+    user = (
+        f"FRAGE:\n{question.strip()}\n\n"
+        f"KONTEXT:\n{context}\n\n"
+        "Erstelle eine ausführliche, quellennahe Antwort. "
+        "Übernimm möglichst viele konkrete Punkte aus dem Kontext, ohne sie unnötig zu paraphrasieren."
+    )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
