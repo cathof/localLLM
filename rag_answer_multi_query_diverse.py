@@ -30,9 +30,9 @@ import argparse
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import requests
@@ -250,6 +250,8 @@ class Retrieved:
     id:    str
     meta:  Dict[str, Any]
     text:  str
+    vec:   Optional[np.ndarray] = None
+    retrieval_query: str = ""
 
 
 def topk_cosine(emb: np.ndarray, qvec: np.ndarray, k: int) -> np.ndarray:
@@ -261,12 +263,86 @@ def topk_cosine(emb: np.ndarray, qvec: np.ndarray, k: int) -> np.ndarray:
     return idx[np.argsort(-scores[idx])]
 
 
+_STOPWORDS_DE = {
+    "als", "am", "an", "auch", "aus", "bei", "bis", "dabei", "das", "dass", "dem", "den",
+    "der", "des", "die", "dies", "diese", "dieser", "doch", "durch", "ein", "eine", "einem",
+    "einen", "einer", "eines", "er", "es", "für", "habe", "haben", "hat", "hinter", "ich",
+    "im", "in", "ist", "ja", "kann", "können", "mich", "mir", "mit", "muss", "müssen", "nach",
+    "noch", "nun", "oder", "sehr", "sein", "sind", "so", "soll", "sollen", "tue", "tun", "und",
+    "unter", "vom", "von", "vor", "war", "was", "welche", "welcher", "welches", "wenn", "wer",
+    "wie", "wir", "wird", "wo", "zu", "zum", "zur",
+}
+
+
+def _normalize_query_text(text: str) -> str:
+    return " ".join((text or "").replace("\n", " ").split()).strip()
+
+
+
+def _extract_query_keywords(text: str, *, max_tokens: int = 8) -> str:
+    raw_tokens = [t.lower() for t in __import__('re').findall(r"[A-Za-zÄÖÜäöüß0-9][A-Za-zÄÖÜäöüß0-9\-_/]+", text)]
+    keep: List[str] = []
+    seen: set[str] = set()
+    for tok in raw_tokens:
+        if len(tok) < 4 or tok in _STOPWORDS_DE or tok in seen:
+            continue
+        seen.add(tok)
+        keep.append(tok)
+        if len(keep) >= max_tokens:
+            break
+    return " ".join(keep)
+
+
+def build_multi_queries(query_text: str, *, mode: str, max_queries: int) -> List[str]:
+    """
+    Create a small set of internal retrieval queries from one user query.
+
+    The goal is recall and aspect coverage, not linguistic perfection.
+    This stays intentionally simple and deterministic:
+      - original query
+      - keyword-compressed variant
+      - generic task-oriented reformulations for process questions
+    """
+    base = _normalize_query_text(query_text)
+    if not base:
+        return []
+
+    variants: List[str] = [base]
+    keywords = _extract_query_keywords(base)
+    if keywords and keywords != base.lower():
+        variants.append(keywords)
+
+    base_l = base.lower()
+    process_cues = ("wie ", "vorgehen", "ablauf", "prozess", "schritte", "checkliste")
+    if keywords and (mode == "segment" or any(c in base_l for c in process_cues)):
+        variants.extend([
+            f"{keywords} vorgehen",
+            f"{keywords} schritte",
+            f"{keywords} checkliste",
+        ])
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for q in variants:
+        qn = _normalize_query_text(q)
+        key = qn.lower()
+        if not qn or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(qn)
+        if len(deduped) >= max_queries:
+            break
+    return deduped
+
+
 def retrieve_from_store(
         store: RagStore,
         qvec: np.ndarray,
         k: int,
+        *,
+        retrieval_query: str = "",
 ) -> List[Retrieved]:
-    """Query a single RAG store and return top-k hits (unranked — rank assigned later)."""
+    """Query a single RAG store and return top-k hits enriched with vectors for MMR."""
     idxs   = topk_cosine(store.emb, qvec, k=k)
     scores = (store.emb @ qvec)[idxs]
     hits: List[Retrieved] = []
@@ -274,7 +350,15 @@ def retrieve_from_store(
         _id  = str(store.ids[i])
         meta = store.index_map.get(_id, {})
         text = store.text_map.get(_id, "")
-        hits.append(Retrieved(rank=0, score=float(s), id=_id, meta=meta, text=text))
+        hits.append(Retrieved(
+            rank=0,
+            score=float(s),
+            id=_id,
+            meta=meta,
+            text=text,
+            vec=store.emb[i],
+            retrieval_query=retrieval_query,
+        ))
     return hits
 
 
@@ -301,9 +385,153 @@ def merge_hits(
     merged = merged[:top_k]
 
     return [
-        Retrieved(rank=i + 1, score=h.score, id=h.id, meta=h.meta, text=h.text)
+        Retrieved(
+            rank=i + 1,
+            score=h.score,
+            id=h.id,
+            meta=h.meta,
+            text=h.text,
+            vec=h.vec,
+            retrieval_query=h.retrieval_query,
+        )
         for i, h in enumerate(merged)
     ]
+
+
+def _source_key(hit: Retrieved) -> str:
+    meta = hit.meta or {}
+    return str(
+        meta.get("source_path")
+        or meta.get("origin_source_path")
+        or meta.get("source_name")
+        or meta.get("origin_source_name")
+        or ""
+    )
+
+
+def _max_similarity_to_selected(hit: Retrieved, selected: Sequence[Retrieved]) -> float:
+    if hit.vec is None or not selected:
+        return 0.0
+    sims: List[float] = []
+    for other in selected:
+        if other.vec is None:
+            continue
+        sims.append(float(hit.vec @ other.vec))
+    return max(sims) if sims else 0.0
+
+
+def diversify_hits_mmr(
+        candidates: List[Retrieved],
+        *,
+        top_k: int,
+        mmr_lambda: float,
+        max_per_source: int,
+) -> List[Retrieved]:
+    """
+    Select a diverse final context with a simple MMR strategy.
+
+    - keeps high-relevance chunks
+    - penalises near-duplicates
+    - optionally caps how many chunks come from the same source file
+    """
+    unique_by_id: Dict[str, Retrieved] = {}
+    for cand in candidates:
+        prev = unique_by_id.get(cand.id)
+        if prev is None or cand.score > prev.score:
+            unique_by_id[cand.id] = cand
+
+    pool = sorted(unique_by_id.values(), key=lambda h: h.score, reverse=True)
+    if not pool:
+        return []
+
+    selected: List[Retrieved] = []
+    source_counts: Dict[str, int] = {}
+
+    def choose_candidate(enforce_source_cap: bool) -> Optional[Retrieved]:
+        best_hit: Optional[Retrieved] = None
+        best_mmr = float("-inf")
+        for cand in pool:
+            if cand.id in {s.id for s in selected}:
+                continue
+            src_key = _source_key(cand)
+            if enforce_source_cap and max_per_source > 0 and source_counts.get(src_key, 0) >= max_per_source:
+                continue
+            redundancy = _max_similarity_to_selected(cand, selected)
+            mmr_score = (mmr_lambda * cand.score) - ((1.0 - mmr_lambda) * redundancy)
+            if mmr_score > best_mmr:
+                best_mmr = mmr_score
+                best_hit = cand
+        return best_hit
+
+    while len(selected) < min(top_k, len(pool)):
+        chosen = choose_candidate(enforce_source_cap=True)
+        if chosen is None:
+            chosen = choose_candidate(enforce_source_cap=False)
+        if chosen is None:
+            break
+        selected.append(chosen)
+        source_counts[_source_key(chosen)] = source_counts.get(_source_key(chosen), 0) + 1
+
+    return [
+        Retrieved(
+            rank=i + 1,
+            score=h.score,
+            id=h.id,
+            meta=h.meta,
+            text=h.text,
+            vec=h.vec,
+            retrieval_query=h.retrieval_query,
+        )
+        for i, h in enumerate(selected)
+    ]
+
+
+def retrieve_multi_query(
+        query_text: str,
+        stores: List[RagStore],
+        *,
+        embed_model,
+        embed_tok,
+        device: torch.device,
+        max_length: int,
+        top_k: int,
+        candidate_k: int,
+        multi_query_count: int,
+        mmr_lambda: float,
+        max_per_source: int,
+        mode: str,
+) -> Tuple[List[Retrieved], List[str]]:
+    """
+    Run internal multi-query retrieval and select a diverse final context.
+    """
+    queries = build_multi_queries(query_text, mode=mode, max_queries=multi_query_count)
+    all_candidates: List[Retrieved] = []
+
+    for query_variant in queries:
+        qvec = embed_e5_query(
+            query_variant,
+            model=embed_model,
+            tokenizer=embed_tok,
+            device=device,
+            max_length=max_length,
+        )
+        for store in stores:
+            all_candidates.extend(
+                retrieve_from_store(
+                    store,
+                    qvec,
+                    k=candidate_k,
+                    retrieval_query=query_variant,
+                )
+            )
+
+    selected = diversify_hits_mmr(
+        all_candidates,
+        top_k=top_k,
+        mmr_lambda=mmr_lambda,
+        max_per_source=max_per_source,
+    )
+    return selected, queries
 
 
 # ── Lazy image captioning ─────────────────────────────────────────────────────
@@ -364,6 +592,8 @@ def enrich_hits_with_image_captions(
             rank=hit.rank, score=hit.score,
             id=hit.id, meta=hit.meta,
             text=enriched_text,
+            vec=hit.vec,
+            retrieval_query=hit.retrieval_query,
         )
 
     hits_with    = [h for h in hits if h.meta.get("embedded_images")]
@@ -404,6 +634,7 @@ def build_context_blocks(
             "n":               h.rank,
             "score":           round(h.score, 4),
             "id":              h.id,
+            "retrieval_query": h.retrieval_query,
             "source_name":     m.get("source_name") or m.get("origin_source_name"),
             "source_path":     m.get("source_path") or m.get("origin_source_path"),
             "chunk_index":     m.get("chunk_index"),
@@ -574,6 +805,149 @@ def build_error_detection_messages(
     ]
 
 
+# ── Document segmentation for segment-level retrieval ─────────────────────────
+
+def split_document_into_segments(
+        document_text: str,
+        *,
+        target_chars: int = 1200,
+        min_chars: int = 250,
+        max_chars: int = 2200,
+) -> List[str]:
+    """
+    Split a full document into retrieval-friendly segments.
+
+    Strategy:
+      1. Preserve double-newline paragraph boundaries
+      2. Build medium-sized segments so each query stays focused
+      3. Merge tiny trailing fragments into neighbours
+
+    This is used only for document checking. The final report still evaluates
+    the entire document, but retrieval happens per segment instead of once for
+    the whole document.
+    """
+    text = (document_text or "").strip()
+    if not text:
+        return []
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return [text]
+
+    segments: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        segment = "\n\n".join(current).strip()
+        if segment:
+            segments.append(segment)
+        current = []
+        current_len = 0
+
+    for para in paragraphs:
+        para_len = len(para)
+
+        if para_len >= max_chars:
+            if current:
+                flush()
+            start = 0
+            while start < para_len:
+                end = min(para_len, start + target_chars)
+                chunk = para[start:end].strip()
+                if chunk:
+                    segments.append(chunk)
+                start = end
+            continue
+
+        candidate_len = current_len + (2 if current else 0) + para_len
+        if current and candidate_len > target_chars:
+            flush()
+
+        current.append(para)
+        current_len = len("\n\n".join(current))
+
+        if current_len >= target_chars:
+            flush()
+
+    flush()
+
+    merged: List[str] = []
+    for seg in segments:
+        if merged and len(seg) < min_chars:
+            candidate = merged[-1] + "\n\n" + seg
+            if len(candidate) <= max_chars:
+                merged[-1] = candidate
+                continue
+        merged.append(seg)
+
+    return merged or [text]
+
+
+def retrieve_document_context_by_segments(
+        document_text: str,
+        stores: List[RagStore],
+        *,
+        embed_model,
+        embed_tok,
+        device: torch.device,
+        args: argparse.Namespace,
+        vision_cfg: Optional[dict],
+        per_segment_k: int = 3,
+) -> Tuple[str, List[Retrieved], List[str], List[str]]:
+    """
+    Segment-level retrieval for document checking.
+
+    Each segment is queried separately. Within each segment, internal
+    multi-query retrieval broadens recall; afterwards MMR keeps the final
+    document context compact and non-redundant.
+    """
+    segments = split_document_into_segments(document_text)
+    all_candidates: List[Retrieved] = []
+    all_queries: List[str] = []
+
+    per_segment_candidate_k = max(per_segment_k, min(max(args.top_k, 8), per_segment_k * 4))
+
+    for segment in segments:
+        hits, queries = retrieve_multi_query(
+            segment,
+            stores,
+            embed_model=embed_model,
+            embed_tok=embed_tok,
+            device=device,
+            max_length=args.query_max_length,
+            top_k=per_segment_k,
+            candidate_k=per_segment_candidate_k,
+            multi_query_count=max(2, min(args.multi_query_count, 3)),
+            mmr_lambda=args.mmr_lambda,
+            max_per_source=max(1, args.max_per_source),
+            mode="segment",
+        )
+        all_candidates.extend(hits)
+        all_queries.extend(queries)
+
+    ranked = diversify_hits_mmr(
+        all_candidates,
+        top_k=args.top_k,
+        mmr_lambda=args.mmr_lambda,
+        max_per_source=args.max_per_source,
+    )
+
+    if vision_cfg and vision_cfg.get("vision_model"):
+        ranked = enrich_hits_with_image_captions(
+            ranked,
+            vision_cfg=vision_cfg,
+            max_workers=args.vision_workers,
+        )
+
+    context, _sources = build_context_blocks(ranked, max_chars=args.context_max_chars)
+    deduped_queries = list(dict.fromkeys(q for q in all_queries if q))
+    return context, ranked, segments, deduped_queries
+
+
 # ── Shared retrieval + output helper ─────────────────────────────────────────
 
 def _retrieve_and_print(
@@ -587,26 +961,31 @@ def _retrieve_and_print(
         vision_cfg: Optional[dict],
         label: str = "ANSWER",
         log_key: str = "question",
-) -> Tuple[str, List[Retrieved]]:
+) -> Tuple[str, List[Retrieved], List[str]]:
     """
-    Shared retrieval pipeline used by both Q&A and document checking:
-      1. Embed the query text
-      2. Retrieve from all stores and merge
-      3. Optionally enrich with vision captions
-      4. Build and optionally print context + sources
+    Shared retrieval pipeline used by both Q&A and document checking.
 
-    Returns (context_str, ranked_hits) for the caller to use in prompting.
+    Retrieval strategy:
+      1. create a few internal query variants
+      2. retrieve a broader candidate pool
+      3. select a diverse final context with MMR
+      4. optionally enrich with vision captions
     """
-    qvec = embed_e5_query(
+    candidate_k = max(args.top_k, min(max(args.top_k * 4, 12), 40))
+    hits, queries = retrieve_multi_query(
         query_text,
-        model=embed_model,
-        tokenizer=embed_tok,
+        stores,
+        embed_model=embed_model,
+        embed_tok=embed_tok,
         device=device,
         max_length=args.query_max_length,
+        top_k=args.top_k,
+        candidate_k=candidate_k,
+        multi_query_count=args.multi_query_count,
+        mmr_lambda=args.mmr_lambda,
+        max_per_source=args.max_per_source,
+        mode="qa",
     )
-
-    all_hits = [retrieve_from_store(s, qvec, k=args.top_k) for s in stores]
-    hits     = merge_hits(all_hits, top_k=args.top_k)
 
     if vision_cfg and vision_cfg.get("vision_model"):
         hits = enrich_hits_with_image_captions(
@@ -618,8 +997,11 @@ def _retrieve_and_print(
     context, sources = build_context_blocks(hits, max_chars=args.context_max_chars)
 
     if args.print_sources:
-        print(json.dumps({log_key: query_text[:120], "sources": sources},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps({
+            log_key: query_text[:120],
+            "multi_queries": queries,
+            "sources": sources,
+        }, ensure_ascii=False, indent=2))
 
     if args.print_context:
         print("\n" + "=" * 90)
@@ -627,7 +1009,7 @@ def _retrieve_and_print(
         print("=" * 90)
         print(context)
 
-    return context, hits
+    return context, hits, queries
 
 
 # ── Mode: Q&A (original) ─────────────────────────────────────────────────────
@@ -647,7 +1029,7 @@ def answer(
     Original Q&A mode — unchanged behaviour.
     Retrieves relevant chunks and answers the question with the LLM.
     """
-    context, _ = _retrieve_and_print(
+    context, _, _ = _retrieve_and_print(
         question, stores,
         embed_model=embed_model, embed_tok=embed_tok,
         device=device, args=args, vision_cfg=vision_cfg,
@@ -677,17 +1059,13 @@ def check_document(
         vision_cfg: Optional[dict],
 ) -> None:
     """
-    Document error detection mode.
+    Document error detection mode using segment-level retrieval.
 
-    Reads the Word document, retrieves relevant context from all RAG stores,
-    optionally enriches retrieved chunks with lazy vision captions, then
-    calls qwen2.5:14b-instruct to detect and classify errors.
-
-    The full document text (~90KB) fits well within the model's context
-    window alongside the retrieved RAG context.
+    The document is still evaluated as a whole, but retrieval is done per
+    segment so later sections and local issues are less likely to be missed.
+    The retrieved evidence is then merged into one final context for the
+    document-level checking prompt.
     """
-    # Import document reader from the ingestion pipeline so we use the same
-    # extraction logic for documents being checked as for the indexed material.
     try:
         from importDocuments import normalize_text, read_docx
     except ImportError as e:
@@ -705,16 +1083,48 @@ def check_document(
 
     print(f"[INFO] Document text: {len(doc_text)} chars")
 
-    context, _ = _retrieve_and_print(
+    per_segment_k = max(1, min(3, args.top_k))
+    context, hits, segments, multi_queries = retrieve_document_context_by_segments(
         doc_text, stores,
         embed_model=embed_model, embed_tok=embed_tok,
         device=device, args=args, vision_cfg=vision_cfg,
-        label="ERROR DETECTION REPORT",
-        log_key="document",
+        per_segment_k=per_segment_k,
     )
 
+    if args.print_sources:
+        sources = []
+        for h in hits:
+            m = h.meta or {}
+            sources.append({
+                "n": h.rank,
+                "score": round(h.score, 4),
+                "id": h.id,
+                "retrieval_query": h.retrieval_query,
+                "source_name": m.get("source_name") or m.get("origin_source_name"),
+                "source_path": m.get("source_path") or m.get("origin_source_path"),
+                "chunk_index": m.get("chunk_index"),
+                "chunk_len": m.get("chunk_len"),
+                "pdf_ocr_used": m.get("pdf_ocr_used"),
+                "pdf_text_reader": m.get("pdf_text_reader"),
+                "ocr_lang": m.get("ocr_lang"),
+                "embedded_images": m.get("embedded_images", []),
+            })
+        print(json.dumps({
+            "document": str(doc_path),
+            "document_chars": len(doc_text),
+            "segments": len(segments),
+            "multi_queries": multi_queries,
+            "sources": sources,
+        }, ensure_ascii=False, indent=2))
+
+    if args.print_context:
+        print("\n" + "=" * 90)
+        print("RETRIEVED CONTEXT")
+        print("=" * 90)
+        print(context)
+
     messages = build_error_detection_messages(doc_text, context)
-    reply    = llm.chat(messages)
+    reply = llm.chat(messages)
 
     print("\n" + "=" * 90)
     print(f"ERROR DETECTION REPORT — {doc_path.name}")
@@ -784,6 +1194,15 @@ def parse_args() -> argparse.Namespace:
                     default=env_str("EMBED_DEVICE", "auto"))
     ap.add_argument("--query_max_length", type=int,
                     default=env_int("QUERY_MAX_LENGTH", 256))
+    ap.add_argument("--multi_query_count", type=int,
+                    default=env_int("MULTI_QUERY_COUNT", 4),
+                    help="Number of internal retrieval query variants to generate")
+    ap.add_argument("--mmr_lambda", type=float,
+                    default=float(env_str("MMR_LAMBDA", "0.75")),
+                    help="MMR relevance weight between 0 and 1; lower means more diversification")
+    ap.add_argument("--max_per_source", type=int,
+                    default=env_int("MAX_PER_SOURCE", 2),
+                    help="Maximum number of final context chunks per source file")
 
     # ── Vision (lazy inference-time captioning) ────────────────────────────────
     ap.add_argument("--vision_model", type=str,
@@ -852,6 +1271,11 @@ def main() -> None:
         print(f"[INFO] Vision captioning enabled: {args.vision_model}")
     else:
         print("[INFO] Vision captioning disabled (no --vision_model set).")
+
+    print(
+        f"[INFO] Retrieval: multi_query_count={args.multi_query_count} | "
+        f"mmr_lambda={args.mmr_lambda:.2f} | max_per_source={args.max_per_source}"
+    )
 
     # ── Dispatch to the appropriate mode ──────────────────────────────────────
 

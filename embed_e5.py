@@ -205,16 +205,18 @@ def embed_jsonl(cfg: EmbedConfig) -> Tuple[int, int, int]:
 
             for _id, meta in zip(batch_ids, batch_meta):
                 idx_row = {
-                    "id": _id,
-                    "source_path": meta.get("source_path"),
-                    "source_name": meta.get("source_name"),
-                    "ext": meta.get("ext"),
-                    "chunk_index": meta.get("chunk_index"),
-                    "chunk_len": meta.get("chunk_len"),
-                    "file_sha256": meta.get("file_sha256"),
-                    "pdf_ocr_used": meta.get("pdf_ocr_used"),
-                    "ocr_lang_used": meta.get("ocr_lang_used"),
-                    "mtime_utc": meta.get("mtime_utc"),
+                    "id":              _id,
+                    "source_path":     meta.get("source_path"),
+                    "source_name":     meta.get("source_name"),
+                    "ext":             meta.get("ext"),
+                    "chunk_index":     meta.get("chunk_index"),
+                    "chunk_len":       meta.get("chunk_len"),
+                    "file_sha256":     meta.get("file_sha256"),
+                    "pdf_ocr_used":    meta.get("pdf_ocr_used"),
+                    "pdf_text_reader": meta.get("pdf_text_reader"),   # new: which library extracted text
+                    "ocr_lang":        meta.get("ocr_lang"),           # renamed from ocr_lang_used
+                    "embedded_images": meta.get("embedded_images", []), # new: image cache paths for inference
+                    "mtime_utc":       meta.get("mtime_utc"),
                 }
                 idx_out.write(json.dumps(idx_row, ensure_ascii=False) + "\n")
 
@@ -244,7 +246,7 @@ def embed_jsonl(cfg: EmbedConfig) -> Tuple[int, int, int]:
         raise RuntimeError(f"No embeddings created from input: {cfg.input_jsonl}")
 
     embeddings = np.vstack(emb_blocks).astype(np.float32)
-    ids_arr = np.array(ids, dtype=str)
+    ids_arr = np.array(ids, dtype="U64")
     np.savez_compressed(cfg.output_npz, ids=ids_arr, embeddings=embeddings)
 
     return n_read, n_embedded, embeddings.shape[1]

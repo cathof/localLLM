@@ -264,6 +264,15 @@ class Section:
 
 
 @dataclass(frozen=True)
+class StructuralUnit:
+    kind: str
+    title: str
+    text: str
+    level: int = 0
+    path: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RuntimeResources:
     token_counter:    "TokenCounter"
     semantic_encoder: "SemanticEncoder"
@@ -435,9 +444,17 @@ _NUMERIC_HEADER_RE = re.compile(r"^(?:\d+(?:\.\d+){0,4}|[A-Z])[\.\)]\s+.+$")
 _SECTION_WORD_RE   = re.compile(
     r"^(?:kapitel|chapter|abschnitt|section|teil|annex|anhang)\b", re.IGNORECASE
 )
-_BULLET_RE         = re.compile(r"^(?:[-*•]\s+|\d+[\.\)]\s+)")
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?\:\;])\s+(?=[A-ZÄÖÜ0-9\"„«»])")
-
+_BULLET_RE              = re.compile(r"^(?:[-*•]\s+|\d+[\.\)]\s+)")
+_SENTENCE_SPLIT_RE      = re.compile(r"(?<=[\.\!\?\:\;])\s+(?=[A-ZÄÖÜ0-9\"„«»])")
+_COLON_SUBHEADER_RE     = re.compile(r"^[A-ZÄÖÜ][^.!?]{0,120}:$")
+_SHORT_TITLEISH_RE      = re.compile(r"^[A-ZÄÖÜ0-9][^.!?]{0,100}$")
+_QUESTION_PREFIX_RE     = re.compile(r"^(?:frage|fragen)\b", re.IGNORECASE)
+_CHECKLIST_PREFIX_RE    = re.compile(r"^(?:checkliste|checklist|todo|to-do)\b", re.IGNORECASE)
+_LIST_CONTINUATION_RE   = re.compile(r"^(?:[a-zäöü0-9].{0,140}|[A-ZÄÖÜ].{0,140}\?)$")
+_PROCEDURE_PREFIX_RE    = re.compile(
+    r"^(?:bei |vor |nach |während |zurück |anschliessend |danach |erste\b|weiteres\b)",
+    re.IGNORECASE,
+)
 
 
 def looks_like_header(line: str) -> tuple[bool, int, str]:
@@ -471,6 +488,52 @@ def looks_like_header(line: str) -> tuple[bool, int, str]:
                 return True, 3, s
 
     return False, 0, ""
+
+
+def looks_like_subheader(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if looks_like_header(s)[0]:
+        return False
+    if _COLON_SUBHEADER_RE.match(s):
+        return True
+    if (
+            _SHORT_TITLEISH_RE.match(s)
+            and len(s.split()) <= 8
+            and not _BULLET_RE.match(s)
+            and not s.endswith((".", "!", "?"))
+    ):
+        letters = [c for c in s if c.isalpha()]
+        if letters:
+            upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
+            if upper_ratio > 0.55 or s == s.title() or _PROCEDURE_PREFIX_RE.match(s):
+                return True
+    return False
+
+
+def classify_list_line(line: str) -> Optional[str]:
+    s = line.strip()
+    if not s:
+        return None
+    if _BULLET_RE.match(s):
+        return "question_block" if "?" in s else "list_block"
+    if s.endswith("?"):
+        return "question_block"
+    if _QUESTION_PREFIX_RE.match(s):
+        return "question_block"
+    if _CHECKLIST_PREFIX_RE.match(s):
+        return "checklist_block"
+    return None
+
+
+def looks_like_list_continuation(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if classify_list_line(s) is not None:
+        return True
+    return bool(_LIST_CONTINUATION_RE.match(s))
 
 
 def split_into_sections(text: str, *, enable_section_awareness: bool) -> list[Section]:
@@ -538,6 +601,107 @@ def split_into_sentences(text: str) -> list[str]:
                 parts.append(s)
     return parts
 
+
+def split_section_into_structural_units(section: Section) -> list[StructuralUnit]:
+    """
+    Split one high-level section into smaller structural units.
+
+    Goals:
+      - preserve hierarchical sub-headings (e.g. "Zurück im FOR")
+      - keep list/question/checklist blocks together
+      - avoid mixing multiple process phases inside one large semantic chunk
+    """
+    raw_lines = [ln.rstrip() for ln in section.body.split("\n")]
+    units: list[StructuralUnit] = []
+
+    current_title = ""
+    current_kind = "paragraph"
+    current_lines: list[str] = []
+
+    def current_path(title: str) -> tuple[str, ...]:
+        parts = [section.title]
+        if title:
+            parts.append(title)
+        return tuple(x for x in parts if x)
+
+    def flush() -> None:
+        nonlocal current_title, current_kind, current_lines
+        text = "\n".join(x for x in current_lines if x.strip()).strip()
+        if text:
+            units.append(
+                StructuralUnit(
+                    kind=current_kind,
+                    title=current_title,
+                    text=text,
+                    level=section.level + (1 if current_title else 0),
+                    path=current_path(current_title),
+                )
+            )
+        current_lines = []
+        current_kind = "paragraph"
+
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i].strip()
+
+        if not line:
+            if current_lines and current_kind == "paragraph":
+                current_lines.append("")
+            i += 1
+            continue
+
+        if looks_like_subheader(line):
+            flush()
+            current_title = line.rstrip(":").strip()
+            i += 1
+            continue
+
+        line_kind = classify_list_line(line)
+
+        if line_kind is not None:
+            if current_kind not in {"list_block", "question_block", "checklist_block"}:
+                flush()
+                current_kind = line_kind
+            elif current_kind != line_kind and current_lines:
+                flush()
+                current_kind = line_kind
+
+            current_lines.append(line)
+
+            j = i + 1
+            while j < len(raw_lines):
+                nxt = raw_lines[j].strip()
+                if not nxt:
+                    break
+                if looks_like_subheader(nxt) or looks_like_header(nxt)[0]:
+                    break
+                if not looks_like_list_continuation(nxt):
+                    break
+                current_lines.append(nxt)
+                j += 1
+            flush()
+            i = j
+            continue
+
+        if current_kind in {"list_block", "question_block", "checklist_block"}:
+            flush()
+
+        current_lines.append(line)
+        i += 1
+
+    flush()
+
+    if not units and section.body.strip():
+        units.append(
+            StructuralUnit(
+                kind="paragraph",
+                title="",
+                text=section.body.strip(),
+                level=section.level,
+                path=current_path(""),
+            )
+        )
+    return units
 
 # ── Token-based splitting ─────────────────────────────────────────────────────
 
@@ -644,9 +808,9 @@ def last_units_with_overlap(
 # ── Semantic chunking ─────────────────────────────────────────────────────────
 
 def prepare_semantic_units(
-        section_body: str, *, chunk_size_tokens: int, counter: TokenCounter
+        text: str, *, chunk_size_tokens: int, counter: TokenCounter
 ) -> list[str]:
-    paras = split_into_paragraphs(section_body)
+    paras = split_into_paragraphs(text)
     if not paras:
         return []
     target = max(40, min(140, chunk_size_tokens // 2))
@@ -680,8 +844,16 @@ def prepare_semantic_units(
     return [u for u in out if u.strip()]
 
 
-def semantic_chunk_section(
-        section: Section,
+def _structural_prefix(unit: StructuralUnit) -> str:
+    if unit.path:
+        return "\n\n".join(x for x in unit.path if x).strip()
+    if unit.title:
+        return unit.title.strip()
+    return ""
+
+
+def semantic_chunk_structural_unit(
+        unit: StructuralUnit,
         *,
         chunk_size_tokens: int,
         chunk_overlap_tokens: int,
@@ -691,57 +863,90 @@ def semantic_chunk_section(
         semantic_threshold: float,
         semantic_min_units: int,
 ) -> list[tuple[str, dict]]:
-    header_prefix = f"{section.title}\n\n" if section.title else ""
+    """
+    Chunk one structural unit. For paragraphs we still use semantic chunking.
+    For question/list/checklist blocks we preserve structure and split conservatively.
+    """
+    header_prefix = _structural_prefix(unit)
+    header_prefix = f"{header_prefix}\n\n" if header_prefix else ""
     header_tokens = counter.count(header_prefix)
-    max_body      = max(1, chunk_size_tokens - header_tokens)
+    max_body = max(1, chunk_size_tokens - header_tokens)
 
-    units = prepare_semantic_units(section.body, chunk_size_tokens=max_body, counter=counter)
+    if unit.kind in {"list_block", "question_block", "checklist_block"}:
+        pieces = split_unit_to_fit(unit.text, max_tokens=max_body, counter=counter)
+        chunks: list[tuple[str, dict]] = []
+        for piece in pieces:
+            text = f"{header_prefix}{piece}".strip()
+            tok_len = counter.count(text)
+            if tok_len < min_chunk_tokens and not chunks:
+                # Preserve short but structurally important list/question blocks.
+                pass
+            elif tok_len < min_chunk_tokens:
+                continue
+            chunks.append((text, {
+                "section_title": unit.path[0] if unit.path else unit.title,
+                "subsection_title": unit.path[-1] if len(unit.path) > 1 else unit.title,
+                "section_level": unit.level,
+                "content_type": unit.kind,
+                "hierarchy_path": list(unit.path),
+                "semantic_chunking_used": False,
+                "semantic_similarity_prev": None,
+            }))
+        return chunks
+
+    units = prepare_semantic_units(unit.text, chunk_size_tokens=max_body, counter=counter)
     if not units:
-        full = f"{header_prefix}{section.body}".strip()
+        full = f"{header_prefix}{unit.text}".strip()
         if full and counter.count(full) >= min_chunk_tokens:
             return [(full, {
-                "section_title":            section.title,
-                "section_level":            section.level,
-                "semantic_chunking_used":   False,
+                "section_title": unit.path[0] if unit.path else unit.title,
+                "subsection_title": unit.path[-1] if len(unit.path) > 1 else unit.title,
+                "section_level": unit.level,
+                "content_type": unit.kind,
+                "hierarchy_path": list(unit.path),
+                "semantic_chunking_used": False,
                 "semantic_similarity_prev": None,
             })]
         return []
 
-    embeddings   = semantic_encoder.encode(units)
+    embeddings = semantic_encoder.encode(units)
     use_semantic = embeddings is not None and len(embeddings) == len(units)
 
     chunks: list[tuple[str, dict]] = []
-    current_units: list[str]       = []
-    current_sims:  list[float]     = []
+    current_units: list[str] = []
+    current_sims: list[float] = []
 
     def flush() -> None:
         nonlocal current_units, current_sims
         if not current_units:
             return
-        body    = "\n\n".join(current_units).strip()
-        text    = f"{header_prefix}{body}".strip()
+        body = "\n\n".join(current_units).strip()
+        text = f"{header_prefix}{body}".strip()
         tok_len = counter.count(text)
         if tok_len >= min_chunk_tokens or not chunks:
             avg_sim = sum(current_sims) / len(current_sims) if current_sims else None
             chunks.append((text, {
-                "section_title":            section.title,
-                "section_level":            section.level,
-                "semantic_chunking_used":   use_semantic,
+                "section_title": unit.path[0] if unit.path else unit.title,
+                "subsection_title": unit.path[-1] if len(unit.path) > 1 else unit.title,
+                "section_level": unit.level,
+                "content_type": unit.kind,
+                "hierarchy_path": list(unit.path),
+                "semantic_chunking_used": use_semantic,
                 "semantic_similarity_prev": avg_sim,
             }))
         overlap_units = last_units_with_overlap(
             current_units, overlap_tokens=chunk_overlap_tokens, counter=counter
         )
         current_units = overlap_units[:]
-        current_sims  = []
+        current_sims = []
 
-    for idx, unit in enumerate(units):
+    for idx, unit_text in enumerate(units):
         if not current_units:
-            current_units = [unit]
+            current_units = [unit_text]
             continue
 
-        candidate_body   = "\n\n".join(current_units + [unit]).strip()
-        candidate_text   = f"{header_prefix}{candidate_body}".strip()
+        candidate_body = "\n\n".join(current_units + [unit_text]).strip()
+        candidate_text = f"{header_prefix}{candidate_body}".strip()
         candidate_tokens = counter.count(candidate_text)
 
         sim = None
@@ -759,11 +964,11 @@ def semantic_chunk_section(
         if candidate_tokens > chunk_size_tokens:
             flush()
             if not current_units:
-                current_units = [unit]
+                current_units = [unit_text]
             else:
-                merged = "\n\n".join(current_units + [unit]).strip()
+                merged = "\n\n".join(current_units + [unit_text]).strip()
                 if counter.count(f"{header_prefix}{merged}") > chunk_size_tokens:
-                    pieces = split_unit_to_fit(unit, max_tokens=max_body, counter=counter)
+                    pieces = split_unit_to_fit(unit_text, max_tokens=max_body, counter=counter)
                     for piece in pieces:
                         cand = "\n\n".join(current_units + [piece]).strip()
                         if counter.count(f"{header_prefix}{cand}") > chunk_size_tokens:
@@ -778,7 +983,7 @@ def semantic_chunk_section(
         if should_split:
             flush()
 
-        current_units.append(unit)
+        current_units.append(unit_text)
         if sim is not None:
             current_sims.append(sim)
 
@@ -795,6 +1000,34 @@ def semantic_chunk_section(
                 chunks[-2] = (merged, merged_meta)
                 chunks.pop()
 
+    return chunks
+
+
+def chunk_structural_units(
+        units: list[StructuralUnit],
+        *,
+        chunk_size_tokens: int,
+        chunk_overlap_tokens: int,
+        min_chunk_tokens: int,
+        counter: TokenCounter,
+        semantic_encoder: SemanticEncoder,
+        semantic_threshold: float,
+        semantic_min_units: int,
+) -> list[tuple[str, dict]]:
+    chunks: list[tuple[str, dict]] = []
+    for unit in units:
+        chunks.extend(
+            semantic_chunk_structural_unit(
+                unit,
+                chunk_size_tokens=chunk_size_tokens,
+                chunk_overlap_tokens=chunk_overlap_tokens,
+                min_chunk_tokens=min_chunk_tokens,
+                counter=counter,
+                semantic_encoder=semantic_encoder,
+                semantic_threshold=semantic_threshold,
+                semantic_min_units=semantic_min_units,
+            )
+        )
     return chunks
 
 
@@ -821,8 +1054,9 @@ def structural_token_chunk_text(
     chunk_idx = 0
 
     for section_index, section in enumerate(sections):
-        chunks = semantic_chunk_section(
-            section,
+        structural_units = split_section_into_structural_units(section)
+        chunks = chunk_structural_units(
+            structural_units,
             chunk_size_tokens=chunk_size_tokens,
             chunk_overlap_tokens=chunk_overlap_tokens,
             min_chunk_tokens=min_chunk_tokens,
@@ -832,18 +1066,26 @@ def structural_token_chunk_text(
             semantic_min_units=sem_min_units,
         )
         for chunk_text, extra_meta in chunks:
-            if counter.count(chunk_text) < min_chunk_tokens:
+            effective_min = min_chunk_tokens
+            if extra_meta.get("content_type") in {"list_block", "question_block", "checklist_block"}:
+                effective_min = max(20, min_chunk_tokens // 2)
+            if counter.count(chunk_text) < effective_min:
                 continue
             meta = {
                 "section_index":              section_index,
                 "section_title":              extra_meta.get("section_title", ""),
+                "subsection_title":           extra_meta.get("subsection_title", ""),
                 "section_level":              extra_meta.get("section_level", 0),
+                "content_type":               extra_meta.get("content_type", "paragraph"),
+                "hierarchy_path":             extra_meta.get("hierarchy_path", []),
                 "semantic_chunking_used":     extra_meta.get("semantic_chunking_used", False),
                 "semantic_similarity_prev":   extra_meta.get("semantic_similarity_prev"),
                 "tokenizer_backend_resolved": counter.resolved_backend,
             }
             if "merged_small_tail" in extra_meta:
                 meta["merged_small_tail"] = extra_meta["merged_small_tail"]
+            if "split_from_long_unit" in extra_meta:
+                meta["split_from_long_unit"] = extra_meta["split_from_long_unit"]
             yield chunk_idx, chunk_text, meta
             chunk_idx += 1
 

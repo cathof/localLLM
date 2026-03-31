@@ -28,6 +28,11 @@ except Exception:
     pytesseract = None  # type: ignore
     image_to_string = None  # type: ignore
 
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None  # type: ignore
+
 
 def test_read_faulty_pdf(
         pdf_path: str | Path,
@@ -61,6 +66,8 @@ def test_read_faulty_pdf(
         "pypdf_text_len": 0,
         "pymupdf_ok": False,
         "pymupdf_text_len": 0,
+        "pdfplumber_ok": False,
+        "pdfplumber_text_len": 0,
         "ocr_used": False,
         "ocr_text_len": 0,
     }
@@ -95,10 +102,25 @@ def test_read_faulty_pdf(
     else:
         print("[TEST] PyMuPDF nicht verfügbar")
 
+    # 3) pdfplumber
+    pdfplumber_text = ""
+    pdfplumber_pages = 0
+    if pdfplumber is not None:
+        try:
+            pdfplumber_text, pdfplumber_pages = _extract_pdf_text_pdfplumber(path)
+            meta["pdfplumber_ok"] = True
+            meta["pdfplumber_text_len"] = len(pdfplumber_text)
+            print(f"[TEST] pdfplumber OK | pages={pdfplumber_pages} | chars={len(pdfplumber_text)}")
+        except Exception as e:
+            print(f"[TEST] pdfplumber FAILED | {e}")
+    else:
+        print("[TEST] pdfplumber nicht verfügbar")
+
     # Beste Textquelle wählen
     candidates = [
         ("pypdf", pypdf_text, pypdf_pages),
         ("pymupdf", pymupdf_text, pymupdf_pages),
+        ("pdfplumber", pdfplumber_text, pdfplumber_pages),
     ]
     candidates = [(name, text, pages) for name, text, pages in candidates if text.strip()]
 
@@ -144,7 +166,8 @@ def _extract_pdf_text_pypdf(path: Path) -> Tuple[str, int]:
 
     for page_index, page in enumerate(reader.pages, start=1):
         try:
-            text = (page.extract_text() or "").strip()
+            #text = (page.extract_text() or "").strip()
+            text = (page.extract_text(extraction_mode="layout") or "").strip()
             if text:
                 parts.append(text)
         except Exception as e:
@@ -171,6 +194,50 @@ def _extract_pdf_text_pymupdf(path: Path) -> Tuple[str, int]:
             print(f"[TEST] PyMuPDF page {page_index + 1} failed: {e}")
 
     return "\n\n".join(parts).strip(), pages
+
+
+def _extract_pdf_text_pdfplumber(path: Path) -> Tuple[str, int]:
+    if pdfplumber is None:
+        raise RuntimeError("pdfplumber nicht installiert")
+
+    parts: list[str] = []
+    page_count = 0
+
+    with pdfplumber.open(path) as pdf:
+        page_count = len(pdf.pages)
+        for page_index, page in enumerate(pdf.pages, start=1):
+            try:
+                # 1. Tabellen extrahieren
+                tables = page.extract_tables()
+                table_texts = []
+                for table in tables:
+                    if not table:
+                        continue
+                    # Zeilen zu Text zusammenfügen
+                    rows = []
+                    for row in table:
+                        # None zu leerem String machen
+                        cleaned_row = [str(cell or "").strip() for cell in row]
+                        # Nur Zeilen nehmen, die nicht komplett leer sind
+                        if any(cleaned_row):
+                            rows.append(" | ".join(cleaned_row))
+                    if rows:
+                        table_texts.append("\n".join(rows))
+
+                # 2. Text extrahieren (ohne Tabellen zu löschen, um Kontext zu behalten)
+                page_text = (page.extract_text() or "").strip()
+
+                # Zusammenführen
+                if table_texts:
+                    combined = page_text + "\n\n[TABLES]\n" + "\n\n".join(table_texts)
+                    parts.append(combined)
+                elif page_text:
+                    parts.append(page_text)
+
+            except Exception as e:
+                print(f"[TEST] pdfplumber page {page_index} failed: {e}")
+
+    return "\n\n".join(parts).strip(), page_count
 
 
 def _resolve_tesseract_cmd(explicit: Optional[str]) -> str:
@@ -250,7 +317,7 @@ def _extract_pdf_text_ocr(
 
 if __name__ == "__main__":
     text, meta = test_read_faulty_pdf(
-        "/Users/catherinehofstetter/Documents/ZHAW/MasterArbeit/LocalLLM/data/NOR-9000.pdf",
+        "/Users/catherinehofstetter/Documents/ZHAW/MasterArbeit/LocalLLM/data/VOR-0062.pptx",
         enable_ocr=True,
         ocr_lang="deu",
         poppler_path=None,

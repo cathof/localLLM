@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -129,6 +129,8 @@ def load_prepared_text_map(prepared_jsonl: Path) -> Dict[str, str]:
 class QueryItem:
     id: str
     text: str
+    expected_source: Optional[Union[str, List[str]]] = None
+    expected_id: Optional[str] = None
 
 
 def load_queries_json(path: Path) -> List[QueryItem]:
@@ -142,11 +144,11 @@ def load_queries_json(path: Path) -> List[QueryItem]:
 
     items: List[QueryItem] = []
 
-    def add_item(qid: str, text: str) -> None:
+    def add_item(qid: str, text: str, expected_source: Optional[Union[str, List[str]]] = None, expected_id: Optional[str] = None) -> None:
         t = (text or "").strip()
         if not t:
             return
-        items.append(QueryItem(id=qid, text=t))
+        items.append(QueryItem(id=qid, text=t, expected_source=expected_source, expected_id=expected_id))
 
     if isinstance(obj, dict) and "queries" in obj:
         q = obj["queries"]
@@ -159,7 +161,9 @@ def load_queries_json(path: Path) -> List[QueryItem]:
             for i, d in enumerate(q, start=1):
                 qid = str(d.get("id") or f"q{i}")
                 text = str(d.get("text") or "")
-                add_item(qid, text)
+                exp_src = d.get("expected_source")
+                exp_id = d.get("expected_id")
+                add_item(qid, text, expected_source=exp_src, expected_id=exp_id)
             return items
 
         if isinstance(q, list) and not q:
@@ -172,7 +176,9 @@ def load_queries_json(path: Path) -> List[QueryItem]:
             elif isinstance(d, dict):
                 qid = str(d.get("id") or f"q{i}")
                 text = str(d.get("text") or "")
-                add_item(qid, text)
+                exp_src = d.get("expected_source")
+                exp_id = d.get("expected_id")
+                add_item(qid, text, expected_source=exp_src, expected_id=exp_id)
         return items
 
     raise ValueError(f"Unsupported queries.json structure in {path}")
@@ -199,7 +205,8 @@ def embed_e5_query(
         tokenizer,
         device: torch.device,
         max_length: int,
-) -> np.ndarray:
+        return_numpy: bool = False,
+) -> Union[np.ndarray, torch.Tensor]:
     """
     E5 convention for searching: prefix with 'query: '.
     Returns a float32 L2-normalized vector [D].
@@ -214,14 +221,17 @@ def embed_e5_query(
     )
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
+    dtype = next(model.parameters()).dtype
 
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden = out.last_hidden_state  # [1, T, D]
-        mask = attention_mask.unsqueeze(-1).type_as(last_hidden)
+        mask = attention_mask.unsqueeze(-1).to(dtype)
         pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-        pooled = l2_normalize(pooled).to(torch.float32).cpu().numpy()
-        return pooled[0].astype(np.float32)
+        pooled = l2_normalize(pooled)
+        if return_numpy:
+            return pooled[0].to(torch.float32).cpu().numpy().astype(np.float32)
+        return pooled[0].to(dtype)
 
 
 # -----------------------------
@@ -234,21 +244,29 @@ class Hit:
     id: str
     meta: Dict[str, Any]
     text_preview: Optional[str]
+    is_match: bool = False
 
 
-def topk_cosine(emb: np.ndarray, qvec: np.ndarray, k: int) -> np.ndarray:
+def topk_cosine(emb: Union[np.ndarray, torch.Tensor], qvec: Union[np.ndarray, torch.Tensor], k: int) -> Union[np.ndarray, torch.Tensor]:
     """
-    emb: [N, D] normalized
-    qvec: [D] normalized
+    emb: [N, D] normalized (NumPy or Torch)
+    qvec: [D] normalized (NumPy or Torch)
     returns indices of top-k scores
     """
-    scores = emb @ qvec  # cosine via dot
-    if k >= scores.shape[0]:
-        return np.argsort(-scores)
-    # partial top-k then sort
-    idx = np.argpartition(-scores, kth=k - 1)[:k]
-    idx = idx[np.argsort(-scores[idx])]
-    return idx
+    if isinstance(emb, torch.Tensor) and isinstance(qvec, torch.Tensor):
+        # PyTorch path (GPU/MPS/CPU)
+        scores = torch.matmul(emb, qvec)  # [N]
+        topk = torch.topk(scores, k=min(k, scores.shape[0]), largest=True, sorted=True)
+        return topk.indices
+    else:
+        # NumPy fallback
+        scores = emb @ qvec  # cosine via dot
+        if k >= scores.shape[0]:
+            return np.argsort(-scores)
+        # partial top-k then sort
+        idx = np.argpartition(-scores, kth=k - 1)[:k]
+        idx = idx[idx.argsort(-scores[idx])]
+        return idx
 
 
 def make_preview(text: str, limit: int) -> str:
@@ -295,15 +313,25 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def print_hits(qid: str, query: str, hits: List[Hit]) -> None:
+def print_hits(qid: str, query: str, hits: List[Hit], expected_source: Optional[Union[str, List[str]]] = None, expected_id: Optional[str] = None) -> None:
     print("\n" + "=" * 90)
     print(f"QUERY {qid}: {query}")
+    if expected_source or expected_id:
+        if isinstance(expected_source, list):
+            src_str = ", ".join(expected_source)
+        else:
+            src_str = expected_source or 'any'
+        gt = f"GT: source={src_str} id={expected_id or 'any'}"
+        print(f"    {gt}")
+
     for h in hits:
         m = h.meta
         src = f"{m.get('source_name')} ({m.get('source_path')})"
         chunk = f"chunk_index={m.get('chunk_index')} chunk_len={m.get('chunk_len')}"
         ocr = f"pdf_ocr_used={m.get('pdf_ocr_used')} ocr_lang_used={m.get('ocr_lang_used')}"
-        print(f"\n{h.rank:>2}. score={h.score:.4f}  id={h.id}")
+
+        match_label = " [MATCH!]" if h.is_match else ""
+        print(f"\n{h.rank:>2}. score={h.score:.4f}  id={h.id}{match_label}")
         print(f"    {src}")
         print(f"    {chunk}  {ocr}")
         if h.text_preview:
@@ -316,16 +344,25 @@ def run_queries(
         model,
         tokenizer,
         device: torch.device,
-        emb: np.ndarray,
+        emb: Union[np.ndarray, torch.Tensor],
         ids: np.ndarray,
         index_rows: List[Dict[str, Any]],
         text_map: Optional[Dict[str, str]],
         top_k: int,
         preview_chars: int,
         query_max_length: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     if len(index_rows) != len(ids):
         raise RuntimeError("index.jsonl and embeddings.npz are not aligned (row count differs).")
+
+    results: List[Dict[str, Any]] = []
+
+    # If device is not CPU, we can move the whole embedding matrix to GPU/MPS once
+    # for extremely fast searching.
+    search_emb = emb
+    if device.type != "cpu" and isinstance(emb, np.ndarray):
+        print(f"Moving embeddings to {device}...")
+        search_emb = torch.from_numpy(emb).to(device)
 
     for qi in queries:
         qvec = embed_e5_query(
@@ -336,10 +373,19 @@ def run_queries(
             max_length=query_max_length,
         )
 
-        idxs = topk_cosine(emb, qvec, k=top_k)
-        scores = (emb @ qvec)[idxs]
+        idxs = topk_cosine(search_emb, qvec, k=top_k)
+        
+        # Get scores for the top-k
+        if isinstance(search_emb, torch.Tensor):
+            scores = torch.matmul(search_emb[idxs], qvec).cpu().numpy()
+            idxs = idxs.cpu().numpy()
+        else:
+            scores = (search_emb @ qvec)[idxs]
 
         hits: List[Hit] = []
+        any_match = False
+        match_ranks: List[int] = []
+
         for rank, (i, s) in enumerate(zip(idxs, scores), start=1):
             _id = str(ids[i])
             meta = index_rows[i]
@@ -348,9 +394,76 @@ def run_queries(
                 t = text_map.get(_id, "")
                 if t:
                     preview = make_preview(t, preview_chars)
-            hits.append(Hit(rank=rank, score=float(s), id=_id, meta=meta, text_preview=preview))
 
-        print_hits(qi.id, qi.text, hits)
+            # Ground truth check
+            is_match = False
+            if qi.expected_source:
+                s_name = str(meta.get("source_name", "")).lower()
+                s_path = str(meta.get("source_path", "")).lower()
+                
+                exp_sources = qi.expected_source
+                if isinstance(exp_sources, str):
+                    exp_sources = [exp_sources]
+                
+                for exp_src in exp_sources:
+                    exp_src_lower = exp_src.lower()
+                    if exp_src_lower in s_name or exp_src_lower in s_path:
+                        is_match = True
+                        break
+
+            if qi.expected_id and _id == qi.expected_id:
+                is_match = True
+
+            if is_match:
+                any_match = True
+                match_ranks.append(rank)
+
+            hits.append(Hit(rank=rank, score=float(s), id=_id, meta=meta, text_preview=preview, is_match=is_match))
+
+        print_hits(qi.id, qi.text, hits, expected_source=qi.expected_source, expected_id=qi.expected_id)
+        
+        results.append({
+            "query_id": qi.id,
+            "has_gt": bool(qi.expected_source or qi.expected_id),
+            "any_match": any_match,
+            "match_ranks": match_ranks,
+            "top_rank": match_ranks[0] if match_ranks else None
+        })
+
+    return results
+
+
+def print_stats(results: List[Dict[str, Any]], k_val: int) -> None:
+    gt_queries = [r for r in results if r["has_gt"]]
+    if not gt_queries:
+        return
+
+    total = len(gt_queries)
+    matches = sum(1 for r in gt_queries if r["any_match"])
+    
+    # Calculate Mean Reciprocal Rank (MRR)
+    mrr = 0.0
+    for r in gt_queries:
+        if r["top_rank"]:
+            mrr += 1.0 / r["top_rank"]
+    mrr /= total
+
+    print("\n" + "=" * 90)
+    print("SEARCH PERFORMANCE SUMMARY (Queries with Ground Truth)")
+    print("-" * 90)
+    print(f"Total queries with GT: {total}")
+    print(f"Success Rate (Recall@{k_val}): {matches}/{total} ({matches/total:.1%})")
+    print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
+    
+    # Optional: Breakdown by rank
+    ranks = [r["top_rank"] for r in gt_queries if r["top_rank"]]
+    if ranks:
+        from collections import Counter
+        counts = Counter(ranks)
+        print("\nFirst match position distribution:")
+        for r in sorted(counts.keys()):
+            print(f"  Rank {r}: {counts[r]} query/ies")
+    print("=" * 90 + "\n")
 
 
 def main() -> None:
@@ -375,6 +488,7 @@ def main() -> None:
         text_map = load_prepared_text_map(prep_path)
 
     device = choose_device(args.device)
+    print(f"Using device: {device}")
     model, tokenizer = load_hf_model(args.model, device)
 
     # Batch mode from queries.json
@@ -383,7 +497,7 @@ def main() -> None:
         if not qpath.exists():
             raise SystemExit(f"queries_json not found: {qpath}")
         queries = load_queries_json(qpath)
-        run_queries(
+        batch_results = run_queries(
             queries,
             model=model,
             tokenizer=tokenizer,
@@ -396,6 +510,7 @@ def main() -> None:
             preview_chars=args.preview_chars,
             query_max_length=args.query_max_length,
         )
+        print_stats(batch_results, k_val=args.top_k)
 
     # Interactive mode
     if args.interactive:

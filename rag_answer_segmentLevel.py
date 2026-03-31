@@ -574,6 +574,145 @@ def build_error_detection_messages(
     ]
 
 
+# ── Document segmentation for segment-level retrieval ─────────────────────────
+
+def split_document_into_segments(
+        document_text: str,
+        *,
+        target_chars: int = 1200,
+        min_chars: int = 250,
+        max_chars: int = 2200,
+) -> List[str]:
+    """
+    Split a full document into retrieval-friendly segments.
+
+    Strategy:
+      1. Preserve double-newline paragraph boundaries
+      2. Build medium-sized segments so each query stays focused
+      3. Merge tiny trailing fragments into neighbours
+
+    This is used only for document checking. The final report still evaluates
+    the entire document, but retrieval happens per segment instead of once for
+    the whole document.
+    """
+    text = (document_text or "").strip()
+    if not text:
+        return []
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return [text]
+
+    segments: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        segment = "\n\n".join(current).strip()
+        if segment:
+            segments.append(segment)
+        current = []
+        current_len = 0
+
+    for para in paragraphs:
+        para_len = len(para)
+
+        if para_len >= max_chars:
+            if current:
+                flush()
+            start = 0
+            while start < para_len:
+                end = min(para_len, start + target_chars)
+                chunk = para[start:end].strip()
+                if chunk:
+                    segments.append(chunk)
+                start = end
+            continue
+
+        candidate_len = current_len + (2 if current else 0) + para_len
+        if current and candidate_len > target_chars:
+            flush()
+
+        current.append(para)
+        current_len = len("\n\n".join(current))
+
+        if current_len >= target_chars:
+            flush()
+
+    flush()
+
+    merged: List[str] = []
+    for seg in segments:
+        if merged and len(seg) < min_chars:
+            candidate = merged[-1] + "\n\n" + seg
+            if len(candidate) <= max_chars:
+                merged[-1] = candidate
+                continue
+        merged.append(seg)
+
+    return merged or [text]
+
+
+def retrieve_document_context_by_segments(
+        document_text: str,
+        stores: List[RagStore],
+        *,
+        embed_model,
+        embed_tok,
+        device: torch.device,
+        args: argparse.Namespace,
+        vision_cfg: Optional[dict],
+        per_segment_k: int = 3,
+) -> Tuple[str, List[Retrieved], List[str]]:
+    """
+    Segment-level retrieval for document checking.
+
+    Each segment is embedded and queried separately. Hits are deduplicated across
+    segments, globally re-ranked by score, optionally vision-enriched, and then
+    packed into one final context for the document-level checker.
+    """
+    segments = split_document_into_segments(document_text)
+    all_hits: List[Retrieved] = []
+
+    for segment in segments:
+        qvec = embed_e5_query(
+            segment,
+            model=embed_model,
+            tokenizer=embed_tok,
+            device=device,
+            max_length=args.query_max_length,
+        )
+        hits_per_store = [retrieve_from_store(s, qvec, k=per_segment_k) for s in stores]
+        merged = merge_hits(hits_per_store, top_k=per_segment_k)
+        all_hits.extend(merged)
+
+    # Global dedupe and rerank across all segment queries
+    by_id: Dict[str, Retrieved] = {}
+    for hit in all_hits:
+        prev = by_id.get(hit.id)
+        if prev is None or hit.score > prev.score:
+            by_id[hit.id] = hit
+
+    ranked = sorted(by_id.values(), key=lambda h: h.score, reverse=True)[:args.top_k]
+    ranked = [
+        Retrieved(rank=i + 1, score=h.score, id=h.id, meta=h.meta, text=h.text)
+        for i, h in enumerate(ranked)
+    ]
+
+    if vision_cfg and vision_cfg.get("vision_model"):
+        ranked = enrich_hits_with_image_captions(
+            ranked,
+            vision_cfg=vision_cfg,
+            max_workers=args.vision_workers,
+        )
+
+    context, _sources = build_context_blocks(ranked, max_chars=args.context_max_chars)
+    return context, ranked, segments
+
+
 # ── Shared retrieval + output helper ─────────────────────────────────────────
 
 def _retrieve_and_print(
@@ -677,17 +816,13 @@ def check_document(
         vision_cfg: Optional[dict],
 ) -> None:
     """
-    Document error detection mode.
+    Document error detection mode using segment-level retrieval.
 
-    Reads the Word document, retrieves relevant context from all RAG stores,
-    optionally enriches retrieved chunks with lazy vision captions, then
-    calls qwen2.5:14b-instruct to detect and classify errors.
-
-    The full document text (~90KB) fits well within the model's context
-    window alongside the retrieved RAG context.
+    The document is still evaluated as a whole, but retrieval is done per
+    segment so later sections and local issues are less likely to be missed.
+    The retrieved evidence is then merged into one final context for the
+    document-level checking prompt.
     """
-    # Import document reader from the ingestion pipeline so we use the same
-    # extraction logic for documents being checked as for the indexed material.
     try:
         from importDocuments import normalize_text, read_docx
     except ImportError as e:
@@ -705,16 +840,46 @@ def check_document(
 
     print(f"[INFO] Document text: {len(doc_text)} chars")
 
-    context, _ = _retrieve_and_print(
+    per_segment_k = max(1, min(3, args.top_k))
+    context, hits, segments = retrieve_document_context_by_segments(
         doc_text, stores,
         embed_model=embed_model, embed_tok=embed_tok,
         device=device, args=args, vision_cfg=vision_cfg,
-        label="ERROR DETECTION REPORT",
-        log_key="document",
+        per_segment_k=per_segment_k,
     )
 
+    if args.print_sources:
+        sources = []
+        for h in hits:
+            m = h.meta or {}
+            sources.append({
+                "n": h.rank,
+                "score": round(h.score, 4),
+                "id": h.id,
+                "source_name": m.get("source_name") or m.get("origin_source_name"),
+                "source_path": m.get("source_path") or m.get("origin_source_path"),
+                "chunk_index": m.get("chunk_index"),
+                "chunk_len": m.get("chunk_len"),
+                "pdf_ocr_used": m.get("pdf_ocr_used"),
+                "pdf_text_reader": m.get("pdf_text_reader"),
+                "ocr_lang": m.get("ocr_lang"),
+                "embedded_images": m.get("embedded_images", []),
+            })
+        print(json.dumps({
+            "document": str(doc_path),
+            "document_chars": len(doc_text),
+            "segments": len(segments),
+            "sources": sources,
+        }, ensure_ascii=False, indent=2))
+
+    if args.print_context:
+        print("\n" + "=" * 90)
+        print("RETRIEVED CONTEXT")
+        print("=" * 90)
+        print(context)
+
     messages = build_error_detection_messages(doc_text, context)
-    reply    = llm.chat(messages)
+    reply = llm.chat(messages)
 
     print("\n" + "=" * 90)
     print(f"ERROR DETECTION REPORT — {doc_path.name}")
