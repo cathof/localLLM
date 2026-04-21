@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -144,7 +144,12 @@ def load_queries_json(path: Path) -> List[QueryItem]:
 
     items: List[QueryItem] = []
 
-    def add_item(qid: str, text: str, expected_source: Optional[Union[str, List[str]]] = None, expected_id: Optional[str] = None) -> None:
+    def add_item(
+            qid: str,
+            text: str,
+            expected_source: Optional[Union[str, List[str]]] = None,
+            expected_id: Optional[str] = None,
+    ) -> None:
         t = (text or "").strip()
         if not t:
             return
@@ -189,10 +194,11 @@ def load_queries_json(path: Path) -> List[QueryItem]:
 # -----------------------------
 def load_hf_model(model_name: str, device: torch.device):
     try:
-        from transformers import AutoModel, AutoTokenizer  # type: ignore
+        from transformers import AutoModel, AutoTokenizer, logging as hf_logging  # type: ignore
     except Exception as e:
         raise RuntimeError("Missing dependency: transformers. Install with: pip install transformers") from e
 
+    hf_logging.set_verbosity_error()
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     mdl = AutoModel.from_pretrained(model_name).eval().to(device)
     return mdl, tok
@@ -231,7 +237,7 @@ def embed_e5_query(
         pooled = l2_normalize(pooled)
         if return_numpy:
             return pooled[0].to(torch.float32).cpu().numpy().astype(np.float32)
-        return pooled[0].to(dtype)
+        return pooled[0].to(torch.float32)
 
 
 # -----------------------------
@@ -247,26 +253,27 @@ class Hit:
     is_match: bool = False
 
 
-def topk_cosine(emb: Union[np.ndarray, torch.Tensor], qvec: Union[np.ndarray, torch.Tensor], k: int) -> Union[np.ndarray, torch.Tensor]:
+def topk_cosine(
+        emb: Union[np.ndarray, torch.Tensor],
+        qvec: Union[np.ndarray, torch.Tensor],
+        k: int,
+) -> Union[np.ndarray, torch.Tensor]:
     """
     emb: [N, D] normalized (NumPy or Torch)
     qvec: [D] normalized (NumPy or Torch)
     returns indices of top-k scores
     """
     if isinstance(emb, torch.Tensor) and isinstance(qvec, torch.Tensor):
-        # PyTorch path (GPU/MPS/CPU)
         scores = torch.matmul(emb, qvec)  # [N]
         topk = torch.topk(scores, k=min(k, scores.shape[0]), largest=True, sorted=True)
         return topk.indices
-    else:
-        # NumPy fallback
-        scores = emb @ qvec  # cosine via dot
-        if k >= scores.shape[0]:
-            return np.argsort(-scores)
-        # partial top-k then sort
-        idx = np.argpartition(-scores, kth=k - 1)[:k]
-        idx = idx[idx.argsort(-scores[idx])]
-        return idx
+
+    scores = emb @ qvec  # cosine via dot
+    if k >= scores.shape[0]:
+        return np.argsort(-scores)
+    idx = np.argpartition(-scores, kth=k - 1)[:k]
+    idx = idx[idx.argsort(-scores[idx])]
+    return idx
 
 
 def make_preview(text: str, limit: int) -> str:
@@ -276,51 +283,20 @@ def make_preview(text: str, limit: int) -> str:
     return t[:limit].rstrip() + " …"
 
 
-# -----------------------------
-# CLI
-# -----------------------------
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Search top-k chunks using E5 query embeddings against embeddings.npz.")
-
-    ap.add_argument("--embeddings", type=str, default=env_str("EMBED_OUT_NPZ", "embeddings.npz"))
-    ap.add_argument("--index", type=str, default=env_str("EMBED_OUT_INDEX", "index.jsonl"))
-    ap.add_argument("--prepared", type=str, default=env_str("OUT_JSONL", "prepared.jsonl"))
-
-    ap.add_argument("--model", type=str, default=env_str("EMBED_MODEL", "intfloat/multilingual-e5-large-instruct"))
-    ap.add_argument("--device", type=str, default=env_str("EMBED_DEVICE", "auto"))
-    ap.add_argument("--query_max_length", type=int, default=env_int("QUERY_MAX_LENGTH", 256))
-
-    ap.add_argument("--top_k", type=int, default=env_int("TOP_K", 8))
-    ap.add_argument("--preview_chars", type=int, default=env_int("PREVIEW_CHARS", 450))
-
-    ap.add_argument(
-        "--queries_json",
-        type=str,
-        default=env_str("QUERIES_JSON", ""),
-        help="Path to JSON file with example queries. If set, runs batch mode.",
-    )
-    ap.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Interactive mode (type queries). If both queries_json and interactive are set, both run.",
-    )
-    ap.add_argument(
-        "--no_text",
-        action="store_true",
-        help="Do not load prepared.jsonl; only output metadata.",
-    )
-
-    return ap.parse_args()
-
-
-def print_hits(qid: str, query: str, hits: List[Hit], expected_source: Optional[Union[str, List[str]]] = None, expected_id: Optional[str] = None) -> None:
+def print_hits(
+        qid: str,
+        query: str,
+        hits: List[Hit],
+        expected_source: Optional[Union[str, List[str]]] = None,
+        expected_id: Optional[str] = None,
+) -> None:
     print("\n" + "=" * 90)
     print(f"QUERY {qid}: {query}")
     if expected_source or expected_id:
         if isinstance(expected_source, list):
             src_str = ", ".join(expected_source)
         else:
-            src_str = expected_source or 'any'
+            src_str = expected_source or "any"
         gt = f"GT: source={src_str} id={expected_id or 'any'}"
         print(f"    {gt}")
 
@@ -328,11 +304,13 @@ def print_hits(qid: str, query: str, hits: List[Hit], expected_source: Optional[
         m = h.meta
         src = f"{m.get('source_name')} ({m.get('source_path')})"
         chunk = f"chunk_index={m.get('chunk_index')} chunk_len={m.get('chunk_len')}"
-        ocr = f"pdf_ocr_used={m.get('pdf_ocr_used')} ocr_lang_used={m.get('ocr_lang_used')}"
+        ocr = f"pdf_ocr_used={m.get('pdf_ocr_used')} ocr_lang={m.get('ocr_lang')}"
+        case_info = f"case_id={m.get('case_id')} document_type={m.get('document_type')}"
 
         match_label = " [MATCH!]" if h.is_match else ""
         print(f"\n{h.rank:>2}. score={h.score:.4f}  id={h.id}{match_label}")
         print(f"    {src}")
+        print(f"    {case_info}")
         print(f"    {chunk}  {ocr}")
         if h.text_preview:
             print(f"    text: {h.text_preview}")
@@ -351,14 +329,13 @@ def run_queries(
         top_k: int,
         preview_chars: int,
         query_max_length: int,
+        case_id: str = "",
 ) -> List[Dict[str, Any]]:
     if len(index_rows) != len(ids):
         raise RuntimeError("index.jsonl and embeddings.npz are not aligned (row count differs).")
 
     results: List[Dict[str, Any]] = []
 
-    # If device is not CPU, we can move the whole embedding matrix to GPU/MPS once
-    # for extremely fast searching.
     search_emb = emb
     if device.type != "cpu" and isinstance(emb, np.ndarray):
         print(f"Moving embeddings to {device}...")
@@ -373,20 +350,30 @@ def run_queries(
             max_length=query_max_length,
         )
 
-        idxs = topk_cosine(search_emb, qvec, k=top_k)
-        
-        # Get scores for the top-k
+        # Retrieve a broader candidate pool first, then filter by case_id if requested.
+        initial_k = min(max(top_k * 5, top_k), len(ids))
+        idxs = topk_cosine(search_emb, qvec, k=initial_k)
+
         if isinstance(search_emb, torch.Tensor):
             scores = torch.matmul(search_emb[idxs], qvec).cpu().numpy()
             idxs = idxs.cpu().numpy()
         else:
             scores = (search_emb @ qvec)[idxs]
 
+        filtered_pairs: List[Tuple[int, float]] = []
+        for i, s in zip(idxs, scores):
+            meta = index_rows[int(i)]
+            if case_id and meta.get("case_id") != case_id:
+                continue
+            filtered_pairs.append((int(i), float(s)))
+            if len(filtered_pairs) >= top_k:
+                break
+
         hits: List[Hit] = []
         any_match = False
         match_ranks: List[int] = []
 
-        for rank, (i, s) in enumerate(zip(idxs, scores), start=1):
+        for rank, (i, s) in enumerate(filtered_pairs, start=1):
             _id = str(ids[i])
             meta = index_rows[i]
             preview = None
@@ -395,16 +382,15 @@ def run_queries(
                 if t:
                     preview = make_preview(t, preview_chars)
 
-            # Ground truth check
             is_match = False
             if qi.expected_source:
                 s_name = str(meta.get("source_name", "")).lower()
                 s_path = str(meta.get("source_path", "")).lower()
-                
+
                 exp_sources = qi.expected_source
                 if isinstance(exp_sources, str):
                     exp_sources = [exp_sources]
-                
+
                 for exp_src in exp_sources:
                     exp_src_lower = exp_src.lower()
                     if exp_src_lower in s_name or exp_src_lower in s_path:
@@ -418,16 +404,31 @@ def run_queries(
                 any_match = True
                 match_ranks.append(rank)
 
-            hits.append(Hit(rank=rank, score=float(s), id=_id, meta=meta, text_preview=preview, is_match=is_match))
+            hits.append(
+                Hit(
+                    rank=rank,
+                    score=float(s),
+                    id=_id,
+                    meta=meta,
+                    text_preview=preview,
+                    is_match=is_match,
+                )
+            )
 
-        print_hits(qi.id, qi.text, hits, expected_source=qi.expected_source, expected_id=qi.expected_id)
-        
+        print_hits(
+            qi.id,
+            qi.text,
+            hits,
+            expected_source=qi.expected_source,
+            expected_id=qi.expected_id,
+        )
+
         results.append({
             "query_id": qi.id,
             "has_gt": bool(qi.expected_source or qi.expected_id),
             "any_match": any_match,
             "match_ranks": match_ranks,
-            "top_rank": match_ranks[0] if match_ranks else None
+            "top_rank": match_ranks[0] if match_ranks else None,
         })
 
     return results
@@ -440,8 +441,7 @@ def print_stats(results: List[Dict[str, Any]], k_val: int) -> None:
 
     total = len(gt_queries)
     matches = sum(1 for r in gt_queries if r["any_match"])
-    
-    # Calculate Mean Reciprocal Rank (MRR)
+
     mrr = 0.0
     for r in gt_queries:
         if r["top_rank"]:
@@ -452,10 +452,9 @@ def print_stats(results: List[Dict[str, Any]], k_val: int) -> None:
     print("SEARCH PERFORMANCE SUMMARY (Queries with Ground Truth)")
     print("-" * 90)
     print(f"Total queries with GT: {total}")
-    print(f"Success Rate (Recall@{k_val}): {matches}/{total} ({matches/total:.1%})")
+    print(f"Success Rate (Recall@{k_val}): {matches}/{total} ({matches / total:.1%})")
     print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
-    
-    # Optional: Breakdown by rank
+
     ranks = [r["top_rank"] for r in gt_queries if r["top_rank"]]
     if ranks:
         from collections import Counter
@@ -466,8 +465,92 @@ def print_stats(results: List[Dict[str, Any]], k_val: int) -> None:
     print("=" * 90 + "\n")
 
 
+
+
+def print_case_chunks(
+        *,
+        ids: np.ndarray,
+        index_rows: List[Dict[str, Any]],
+        text_map: Optional[Dict[str, str]],
+        preview_chars: int,
+        case_id: str,
+) -> int:
+    matches: List[Tuple[int, Dict[str, Any]]] = []
+    for i, meta in enumerate(index_rows):
+        if meta.get("case_id") == case_id:
+            matches.append((i, meta))
+
+    print("\n" + "=" * 90)
+    print(f"CHUNKS FOR case_id={case_id}")
+    print("=" * 90)
+
+    if not matches:
+        print("No chunks found for this case_id.")
+        return 0
+
+    for rank, (i, meta) in enumerate(matches, start=1):
+        _id = str(ids[i])
+        src = f"{meta.get('source_name')} ({meta.get('source_path')})"
+        chunk = f"chunk_index={meta.get('chunk_index')} chunk_len={meta.get('chunk_len')}"
+        ocr = f"pdf_ocr_used={meta.get('pdf_ocr_used')} ocr_lang={meta.get('ocr_lang')}"
+        case_info = f"case_id={meta.get('case_id')} document_type={meta.get('document_type')}"
+
+        print(f"\n{rank:>2}. id={_id}")
+        print(f"    {src}")
+        print(f"    {case_info}")
+        print(f"    {chunk}  {ocr}")
+
+        if text_map is not None:
+            t = text_map.get(_id, "")
+            if t:
+                print(f"    text: {make_preview(t, preview_chars)}")
+
+    return len(matches)
+
+# -----------------------------
+# CLI
+# -----------------------------
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Search top-k chunks using E5 query embeddings against embeddings.npz.")
+
+    ap.add_argument("--embeddings", type=str, default=env_str("EMBED_OUT_NPZ", "embeddings_rules.npz"))
+    ap.add_argument("--index", type=str, default=env_str("EMBED_OUT_INDEX", "index_rules.jsonl"))
+    ap.add_argument("--prepared", type=str, default=env_str("OUT_JSONL", "prepared_rules.jsonl"))
+
+    ap.add_argument("--model", type=str, default=env_str("EMBED_MODEL", "intfloat/multilingual-e5-large-instruct"))
+    ap.add_argument("--device", type=str, default=env_str("EMBED_DEVICE", "auto"))
+    ap.add_argument("--query_max_length", type=int, default=env_int("QUERY_MAX_LENGTH", 256))
+
+    ap.add_argument("--top_k", type=int, default=env_int("TOP_K", 8))
+    ap.add_argument("--preview_chars", type=int, default=env_int("PREVIEW_CHARS", 450))
+    ap.add_argument("--case_id", type=str, default=env_str("CASE_ID", ""), help="Optional: restrict search to one case_id")
+
+    ap.add_argument(
+        "--queries_json",
+        type=str,
+        default="",
+        help="Path to JSON file with example queries. If set, runs batch mode. If omitted, no batch queries are loaded automatically.",
+    )
+    ap.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Interactive mode (type queries). If both queries_json and interactive are set, both run.",
+    )
+    ap.add_argument(
+        "--no_text",
+        action="store_true",
+        help="Do not load prepared.jsonl; only output metadata.",
+    )
+
+    return ap.parse_args()
+
 def main() -> None:
     args = parse_args()
+
+    print("RUNNING FILE:", __file__)
+    print("ARGV queries_json raw:", repr(args.queries_json))
+    print("ARGV interactive:", args.interactive)
+    print("ARGV case_id:", repr(args.case_id))
 
     emb_path = Path(args.embeddings).resolve()
     idx_path = Path(args.index).resolve()
@@ -491,9 +574,13 @@ def main() -> None:
     print(f"Using device: {device}")
     model, tokenizer = load_hf_model(args.model, device)
 
-    # Batch mode from queries.json
-    if args.queries_json:
-        qpath = Path(args.queries_json).resolve()
+    if args.case_id:
+        print(f"Restricting search to case_id={args.case_id}")
+
+    queries_json = args.queries_json.strip()
+
+    if queries_json:
+        qpath = Path(queries_json).resolve()
         if not qpath.exists():
             raise SystemExit(f"queries_json not found: {qpath}")
         queries = load_queries_json(qpath)
@@ -509,10 +596,10 @@ def main() -> None:
             top_k=args.top_k,
             preview_chars=args.preview_chars,
             query_max_length=args.query_max_length,
+            case_id=args.case_id,
         )
         print_stats(batch_results, k_val=args.top_k)
 
-    # Interactive mode
     if args.interactive:
         print("\nInteractive search. Empty input or Ctrl-D to exit.")
         while True:
@@ -534,11 +621,22 @@ def main() -> None:
                 top_k=args.top_k,
                 preview_chars=args.preview_chars,
                 query_max_length=args.query_max_length,
+                case_id=args.case_id,
             )
 
-    if not args.queries_json and not args.interactive:
-        print("Nothing to do. Provide --queries_json <file> and/or --interactive.")
-
+    if not queries_json and not args.interactive:
+        if args.case_id:
+            count = print_case_chunks(
+                ids=ids,
+                index_rows=index_rows,
+                text_map=text_map,
+                preview_chars=args.preview_chars,
+                case_id=args.case_id,
+            )
+            if count == 0:
+                print("\nNothing found for the requested case_id.")
+        else:
+            print("Nothing to do. Provide --queries_json <file>, and/or --interactive, or use --case_id to list chunks for one case.")
 
 if __name__ == "__main__":
     main()

@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
 
 import numpy as np
 import torch
@@ -212,10 +214,13 @@ def embed_jsonl(cfg: EmbedConfig) -> Tuple[int, int, int]:
                     "chunk_index":     meta.get("chunk_index"),
                     "chunk_len":       meta.get("chunk_len"),
                     "file_sha256":     meta.get("file_sha256"),
+                    "source_kind":     meta.get("source_kind"),
+                    "case_id":         meta.get("case_id"),
+                    "document_type":   meta.get("document_type"),
                     "pdf_ocr_used":    meta.get("pdf_ocr_used"),
-                    "pdf_text_reader": meta.get("pdf_text_reader"),   # new: which library extracted text
-                    "ocr_lang":        meta.get("ocr_lang"),           # renamed from ocr_lang_used
-                    "embedded_images": meta.get("embedded_images", []), # new: image cache paths for inference
+                    "pdf_text_reader": meta.get("pdf_text_reader"),
+                    "ocr_lang":        meta.get("ocr_lang"),
+                    "embedded_images": meta.get("embedded_images", []),
                     "mtime_utc":       meta.get("mtime_utc"),
                 }
                 idx_out.write(json.dumps(idx_row, ensure_ascii=False) + "\n")
@@ -258,9 +263,9 @@ def embed_jsonl(cfg: EmbedConfig) -> Tuple[int, int, int]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Embed prepared.jsonl with multilingual-e5 via PyTorch (MPS/CUDA/CPU).")
 
-    ap.add_argument("--in", dest="input_jsonl", type=str, default=env_str("EMBED_INPUT", "prepared.jsonl"))
-    ap.add_argument("--out_npz", type=str, default=env_str("EMBED_OUT_NPZ", "embeddings.npz"))
-    ap.add_argument("--out_index", type=str, default=env_str("EMBED_OUT_INDEX", "index.jsonl"))
+    ap.add_argument("--in", dest="input_jsonl", type=str, default=env_str("EMBED_INPUT", "prepared_rules.jsonl"))
+    ap.add_argument("--out_npz", type=str, default=env_str("EMBED_OUT_NPZ", "embeddings_rules.npz"))
+    ap.add_argument("--out_index", type=str, default=env_str("EMBED_OUT_INDEX", "index_rules.jsonl"))
 
     ap.add_argument("--model", type=str, default=env_str("EMBED_MODEL", "intfloat/multilingual-e5-large-instruct"))
     ap.add_argument("--device", type=str, default=env_str("EMBED_DEVICE", "auto"))

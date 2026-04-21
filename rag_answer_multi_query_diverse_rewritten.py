@@ -5,16 +5,16 @@ import argparse
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import requests
 import torch
-import time
-from datetime import datetime
 
 
 # ── .env loader ───────────────────────────────────────────────────────────────
@@ -28,9 +28,7 @@ def load_dotenv(dotenv_path: str | Path = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        os.environ.setdefault(k, v)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 load_dotenv(".env")
@@ -38,13 +36,18 @@ load_dotenv(".env")
 
 def env_str(key: str, default: str) -> str:
     v = os.environ.get(key)
-    return v if v is not None and v.strip() != "" else default
+    return v if v is not None and v.strip() else default
 
 
 def env_int(key: str, default: int) -> int:
     v = os.environ.get(key, "").strip()
     return int(v) if v else default
 
+def env_bool(key: str, default: bool = False) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 def require_env(key: str) -> str:
     v = os.environ.get(key, "").strip()
@@ -82,6 +85,239 @@ def choose_device(name: str) -> torch.device:
 
 def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return x / (x.norm(p=2, dim=1, keepdim=True) + eps)
+
+
+# ── Generic JSONL helper ──────────────────────────────────────────────────────
+
+def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                yield json.loads(s)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON at line {line_no} in {path}: {e}") from e
+
+
+# ── Taxonomy ──────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ErrorCatalog:
+    raw: Dict[str, Any]
+    main_classes: Dict[str, Dict[str, Any]]
+    sub_by_main: Dict[str, Dict[str, Dict[str, Any]]]
+    sub_to_main: Dict[str, str]
+    change_types: Dict[str, Dict[str, Any]]
+    severity_levels: Dict[str, Dict[str, Any]]
+
+    @property
+    def allowed_main_labels(self) -> Set[str]:
+        return {v["label"] for v in self.main_classes.values()}
+
+    @property
+    def allowed_subclasses_by_main_label(self) -> Dict[str, Set[str]]:
+        out: Dict[str, Set[str]] = {}
+        for main_id, main_obj in self.main_classes.items():
+            out[main_obj["label"]] = {sub["label"] for sub in self.sub_by_main.get(main_id, {}).values()}
+        return out
+
+    @property
+    def allowed_change_labels(self) -> Set[str]:
+        return {v["label"] for v in self.change_types.values()}
+
+    @property
+    def allowed_severity_labels(self) -> Set[str]:
+        return {v["label"] for v in self.severity_levels.values()}
+
+    @property
+    def subclass_label_to_main_label(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for main_id, main_obj in self.main_classes.items():
+            main_label = main_obj["label"]
+            for sub in self.sub_by_main.get(main_id, {}).values():
+                out[sub["label"]] = main_label
+        return out
+
+
+def load_taxonomy_json(path: Path) -> ErrorCatalog:
+    if not path.exists():
+        raise SystemExit(f"Taxonomy file not found: {path}")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise SystemExit("Taxonomy JSON must be a top-level object.")
+
+    main_classes_list = raw.get("main_classes")
+    change_types_list = raw.get("change_types")
+    severity_levels_list = raw.get("severity_levels")
+
+    if not isinstance(main_classes_list, list) or not isinstance(change_types_list, list) or not isinstance(severity_levels_list, list):
+        raise SystemExit("Taxonomy JSON must contain main_classes, change_types, and severity_levels arrays.")
+
+    main_classes: Dict[str, Dict[str, Any]] = {}
+    sub_by_main: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    sub_to_main: Dict[str, str] = {}
+
+    for entry in main_classes_list:
+        if not isinstance(entry, dict):
+            continue
+        main_id = str(entry.get("id") or "").strip()
+        main_label = str(entry.get("label") or "").strip()
+        if not main_id or not main_label:
+            continue
+
+        main_classes[main_id] = entry
+        sub_by_main[main_id] = {}
+
+        subclasses = entry.get("subclasses", [])
+        if not isinstance(subclasses, list):
+            continue
+
+        for sub in subclasses:
+            if not isinstance(sub, dict):
+                continue
+            sub_id = str(sub.get("id") or "").strip()
+            sub_label = str(sub.get("label") or "").strip()
+            if not sub_id or not sub_label:
+                continue
+            sub_by_main[main_id][sub_id] = sub
+            sub_to_main[sub_label] = main_label
+
+    change_types: Dict[str, Dict[str, Any]] = {}
+    for entry in change_types_list:
+        if not isinstance(entry, dict):
+            continue
+        _id = str(entry.get("id") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        if _id and label:
+            change_types[_id] = entry
+
+    severity_levels: Dict[str, Dict[str, Any]] = {}
+    for entry in severity_levels_list:
+        if not isinstance(entry, dict):
+            continue
+        _id = str(entry.get("id") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        if _id and label:
+            severity_levels[_id] = entry
+
+    if not main_classes or not change_types or not severity_levels:
+        raise SystemExit("Taxonomy JSON contains no valid classes, change types, or severity levels.")
+
+    return ErrorCatalog(
+        raw=raw,
+        main_classes=main_classes,
+        sub_by_main=sub_by_main,
+        sub_to_main=sub_to_main,
+        change_types=change_types,
+        severity_levels=severity_levels,
+    )
+
+def build_label_to_id_maps(catalog: ErrorCatalog):
+    sub_label_to_id = {}
+    for main_id, subs in catalog.sub_by_main.items():
+        for sub_id, sub in subs.items():
+            sub_label_to_id[sub["label"]] = sub_id
+
+    change_label_to_id = {
+        v["label"]: k for k, v in catalog.change_types.items()
+    }
+
+    severity_label_to_id = {
+        v["label"]: k for k, v in catalog.severity_levels.items()
+    }
+
+    return sub_label_to_id, change_label_to_id, severity_label_to_id
+
+def save_predictions_jsonl(
+        report: Dict[str, Any],
+        case_id: str,
+        output_path: Path,
+        catalog: ErrorCatalog,
+) -> None:
+    sub_map, change_map, severity_map = build_label_to_id_maps(catalog)
+
+    segments: Dict[int, List[Dict[str, Any]]] = {}
+
+    all_findings = report.get("factual_findings", []) + report.get("language_findings", [])
+
+    for i, item in enumerate(all_findings, start=1):
+        seg_idx = item.get("segment_index")
+        if seg_idx is None:
+            continue
+
+        subclass_label = str(item.get("subklasse") or "").strip()
+        change_label = str(item.get("aenderungstyp") or "").strip()
+        severity_label = str(item.get("schweregrad") or "").strip()
+        span_text = str(item.get("stelle_im_segment") or "").strip()
+
+        if not span_text:
+            continue
+
+        subclass_id = sub_map.get(subclass_label)
+        change_type_id = change_map.get(change_label)
+        severity_id = severity_map.get(severity_label)
+
+        if not subclass_id or not change_type_id or not severity_id:
+            continue
+
+        finding = {
+            "finding_id": f"PRED-{case_id}-{i:04d}",
+            "subclass_id": subclass_id,
+            "change_type_id": change_type_id,
+            "severity_id": severity_id,
+            "span_text": span_text,
+            "rationale": str(item.get("begruendung") or "").strip(),
+        }
+
+        vorschlag = str(item.get("vorschlag") or "").strip()
+        if vorschlag:
+            finding["correction"] = vorschlag
+
+        segments.setdefault(seg_idx, []).append(finding)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as f:
+        for seg_idx, findings in sorted(segments.items()):
+            obj = {
+                "case_id": case_id,
+                "segment_id": f"{case_id}_seg_{seg_idx:04d}",
+                "segment_index": seg_idx,
+                "predicted_findings": findings,
+            }
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    print(f"[INFO] Saved predictions to {output_path}")
+
+def build_taxonomy_block(catalog: ErrorCatalog) -> str:
+    lines: List[str] = ["Zulässige Klassifikation:"]
+    for main_id, main_obj in catalog.main_classes.items():
+        lines.append(main_obj["label"])
+        for sub in catalog.sub_by_main.get(main_id, {}).values():
+            desc = str(sub.get("description") or "").strip()
+            if desc:
+                lines.append(f"  - {sub['label']}: {desc}")
+            else:
+                lines.append(f"  - {sub['label']}")
+
+    lines.append("")
+    lines.append("Zulässige Änderungstypen:")
+    for obj in catalog.change_types.values():
+        desc = str(obj.get("description") or "").strip()
+        if desc:
+            lines.append(f"  - {obj['label']}: {desc}")
+        else:
+            lines.append(f"  - {obj['label']}")
+
+    lines.append("")
+    lines.append("Zulässige Schweregrade:")
+    for obj in catalog.severity_levels.values():
+        lines.append(f"  - {obj['label']}")
+
+    return "\n".join(lines)
 
 
 # ── RAG store ─────────────────────────────────────────────────────────────────
@@ -150,18 +386,6 @@ def load_npz(npz_path: Path) -> Tuple[np.ndarray, np.ndarray]:
     if len(ids) != emb.shape[0]:
         raise ValueError(f"ids length {len(ids)} != embeddings rows {emb.shape[0]}")
     return ids, emb
-
-
-def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                yield json.loads(s)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON at line {line_no} in {path}: {e}") from e
 
 
 def load_index_map(index_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -360,10 +584,11 @@ def retrieve_from_store(
         emb_sub = store.emb[row_idx]
         local_top = topk_cosine(emb_sub, qvec, k=min(k, emb_sub.shape[0]))
         idxs = row_idx[local_top]
+        scores = (emb_sub @ qvec)[local_top]
     else:
         idxs = topk_cosine(store.emb, qvec, k=k)
+        scores = (store.emb @ qvec)[idxs]
 
-    scores = (store.emb @ qvec)[idxs]
     hits: List[Retrieved] = []
     for i, s in zip(idxs, scores):
         _id = str(store.ids[i])
@@ -779,7 +1004,7 @@ class OllamaClient(LLMClient):
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
         url = f"{self.base_url}/api/chat"
-        payload: Dict[str, Any] = {
+        payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
@@ -838,55 +1063,49 @@ def build_factual_review_messages(
         segment_text: str,
         rules_context: str,
         material_context: str,
+        catalog: ErrorCatalog,
 ) -> List[Dict[str, str]]:
     system = (
         "Du bist Agent 2: Fachprüfer für technische Dokumente.\n"
         "Du erhältst genau ein DOKUMENTSEGMENT, REGELWERK-QUELLEN und FALLMATERIAL-QUELLEN.\n\n"
         "Deine Aufgabe:\n"
-        "Erkenne nur fachliche, regelbasierte oder inhaltliche Fehler im Dokumentsegment.\n\n"
-        "Erlaubte Fehlerklassen:\n"
-        "  Inhaltlicher Fehler\n"
-        "  Fehlende Information\n"
-        "  Formaler Fehler\n"
-        "  Veraltete Information\n\n"
+        "Erkenne fachliche, normative, strukturelle, rechtliche oder formale Fehler im Dokumentsegment "
+        "und klassifiziere sie ausschliesslich mit der vorgegebenen Taxonomie.\n\n"
+        f"{build_taxonomy_block(catalog)}\n\n"
         "VERBOTEN:\n"
-        "  - Rechtschreibung, Grammatik, Stil\n"
         "  - freie Quellenangaben ausserhalb der gegebenen source_refs\n"
         "  - erfundene source_refs\n"
-        "  - 'begruendung' darf KEINEN Text aus dem DOKUMENTSEGMENT verwenden\n"
-        "  - 'begruendung' darf NUR auf Informationen aus REGELWERK-QUELLEN oder "
-        "FALLMATERIAL-QUELLEN basieren\n"
+        "  - erfundene Hauptklassen, Subklassen, Änderungstypen oder Schweregrade\n"
+        "  - 'begruendung' darf KEINEN Text aus dem DOKUMENTSEGMENT als Beleg verwenden\n"
+        "  - 'begruendung' darf NUR auf REGELWERK-QUELLEN oder FALLMATERIAL-QUELLEN basieren\n"
+        "  - 'ss' als Fehler melden: In der Schweiz wird 'ss' statt 'ß' geschrieben "
+        "(Fussgänger, Strasse, Fluss). Das ist KORREKT und kein Fehler.\n\n"
         "  - Fehler melden, die das Segment selbst bereits korrigiert oder erklärt\n\n"
-        "Quellenformat:\n"
-        "Jede Quelle beginnt mit einer Zeile wie:\n"
-        "SRC_M_1 | chunk_id=... | document=... | source_kind=...\n"
-        "oder\n"
-        "SRC_R_1 | chunk_id=... | document=... | source_kind=...\n\n"
         "PFLICHTFORMAT für 'begruendung':\n"
-        "  Beginne immer mit 'Laut [SRC_X_N]:' gefolgt von der relevanten Aussage\n"
-        "  aus der Quelle — nie aus dem DOKUMENTSEGMENT.\n"
-        "  Beispiel: 'Laut [SRC_M_2]: Die Gluttemperatur von Holzkohle beträgt ca. 700 °C,\n"
-        "  nicht 473 °C wie im Segment angegeben.'\n\n"
-        "Wichtig:\n"
-        "  - Gib in der Antwort NUR source_refs an, niemals chunk_id oder document.\n"
-        "  - Ein Fehler ist nur erlaubt, wenn er direkt durch mindestens eine source_ref belegt ist.\n"
-        "  - Wenn kein fachlich belegbarer Fehler vorliegt, antworte exakt mit: {\"errors\":[]}\n"
-        "  - Antworte ausschliesslich als valides JSON ohne Markdown und ohne Einleitung.\n\n"
+        "  Beginne immer mit 'Laut [SRC_X_N]:' gefolgt von der relevanten Aussage aus der Quelle.\n\n"
+        "Klassifikationsregeln:\n"
+        "  - Verwende pro Finding genau eine Hauptklasse und genau eine passende Subklasse.\n"
+        "  - Verwende genau einen Änderungstyp.\n"
+        "  - Vergib einen Schweregrad: niedrig, mittel oder hoch.\n"
+        "  - Ein Finding ist nur erlaubt, wenn es direkt durch mindestens eine source_ref belegt ist.\n"
+        "  - Wenn der Fehler rein sprachlich oder stilistisch ist, melde ihn NICHT hier.\n\n"
+        "Wenn kein fachlich belegbarer Fehler vorliegt, antworte exakt mit: {\"errors\":[]}\n"
+        "Antworte ausschliesslich als valides JSON ohne Markdown und ohne Einleitung.\n\n"
         "Format:\n"
-        "{\"errors\":["
-        "{\"fehlerklasse\":\"Inhaltlicher Fehler\","
-        "\"stelle_im_segment\":\"<kurzer Originalausschnitt aus dem Segment>\","
-        "\"begruendung\":\"Laut [SRC_X_N]: <relevante Aussage aus der Quelle>\","
-        "\"source_refs\":[\"SRC_M_1\",\"SRC_R_2\"]}"
-        "]}"
+        "{\"errors\":[{"
+        "\"hauptklasse\":\"QM/QS-Konformität\","
+        "\"subklasse\":\"Dokumentationspflicht\","
+        "\"aenderungstyp\":\"Normativer Mangel\","
+        "\"schweregrad\":\"mittel\","
+        "\"stelle_im_segment\":\"<kurzer Originalausschnitt>\","
+        "\"begruendung\":\"Laut [SRC_R_1]: <relevante Aussage aus der Quelle>\","
+        "\"source_refs\":[\"S1_R_1\",\"S1_M_2\"]}]}"
     )
     user = (
         f"DOKUMENTSEGMENT:\n{segment_text.strip()}\n\n"
         f"REGELWERK-QUELLEN:\n{rules_context.strip()}\n\n"
         f"FALLMATERIAL-QUELLEN:\n{material_context.strip()}\n\n"
-        "Erstelle die fachliche Fehlerliste als JSON.\n"
-        "Für 'begruendung': beginne mit 'Laut [SRC_X_N]:' und zitiere aus den Quellen, "
-        "nicht aus dem DOKUMENTSEGMENT."
+        "Erstelle die fachliche Fehlerliste als JSON."
     )
     return [
         {"role": "system", "content": system},
@@ -896,43 +1115,48 @@ def build_factual_review_messages(
 
 def build_language_review_messages(segment_text: str) -> List[Dict[str, str]]:
     system = (
-        "Du bist Agent 3: Sprachprüfer.\n"
-        "Du prüfst ausschliesslich eindeutige Rechtschreibfehler.\n\n"
+        "Du bist Agent 3: Sprach- und Formalprüfer.\n"
+        "Du meldest NUR eindeutige, lokale formale Fehler.\n\n"
+        "Zulässige Taxonomie für die Ausgabe:\n"
+        "  hauptklasse = Formales\n"
+        "  subklasse = Redaktionelle Korrektur ODER Referenzen (formal) ODER Dokumentstruktur ODER Adressierung\n"
+        "  aenderungstyp = Redaktionelle Korrektur\n"
+        "  schweregrad = niedrig\n\n"
         "ERLAUBT:\n"
-        "  - Rechtschreibung: falsch geschriebene Wörter (z.B. 'Vermassungen' statt 'Vermessungen')\n\n"
-        "VERBOTEN — melde diese Fälle niemals:\n"
-        "  - Kommasetzung jeglicher Art\n"
-        "  - Grammatik, Satzbau, Wortstellung\n"
-        "  - Stilistik, Wortwahl, Umformulierungen\n"
-        "  - Tempuswechsel oder andere inhaltliche Korrekturen\n"
-        "  - Korrekturen innerhalb von Anführungszeichen (« », \" \", ' ')\n"
-        "  - Markennamen, Eigennamen, Abkürzungen (z.B. swisstopo, FOR, LSI)\n"
-        "  - Fehler, die du nicht als exakten String im Segment nachweisen kannst\n\n"
-        "WICHTIGE REGELN:\n"
-        "  - Verwende bei 'stelle_im_segment' nur exakte, wörtliche Teilstrings aus dem Segment.\n"
-        "  - Erfinde keine Stellen und rekonstruiere keinen Text.\n"
-        "  - Der 'vorschlag' muss sich vom Original unterscheiden — nur das falsch geschriebene "
-        "Wort korrigieren, sonst nichts ändern.\n"
-        "  - Wenn kein eindeutiger Rechtschreibfehler vorliegt, antworte exakt mit: {\"errors\":[]}\n\n"
-        "Antworte ausschliesslich als valides JSON ohne Markdown und ohne Einleitung.\n"
+        "  - eindeutige Orthografiefehler\n"
+        "  - eindeutige Zeichensetzungsfehler\n"
+        "  - eindeutige lokale Grammatikfehler\n"
+        "  - eindeutige formale Referenz- oder Adressierungsfehler\n\n"
+        "NICHT ERLAUBT:\n"
+        "  - Stilverbesserungen oder schönere Formulierungen\n"
+        "  - minimale Umformulierungen ohne klaren Fehler\n"
+        "  - Terminologieangleichungen oder 'konsistenter Gebrauch'\n"
+        "  - Eigennamen, Produktnamen, Institutionen, Marken, Fahrzeugbezeichnungen, Aktenzeichen\n"
+        "  - Abkürzungen, sofern nicht eindeutig falsch ausgeschrieben\n"
+        "  - Korrekturen innerhalb von Anführungszeichen\n"
+        "  - jede Korrektur, bei der du nicht mit sehr hoher Sicherheit sagen kannst, dass der Vorschlag korrekt ist\n"
+        "  - 'ss' als Fehler melden: In der Schweiz ist 'ss' korrekt\n\n"
+        "Wenn kein eindeutiger Fehler vorliegt, antworte exakt mit: {\"errors\":[]}\n"
+        "Antworte ausschliesslich als valides JSON.\n\n"
         "Format:\n"
-        "{\"errors\":["
-        "{\"fehlerklasse\":\"Rechtschreibung\","
+        "{\"errors\":[{"
+        "\"hauptklasse\":\"Formales\","
+        "\"subklasse\":\"Redaktionelle Korrektur\","
+        "\"aenderungstyp\":\"Redaktionelle Korrektur\","
+        "\"schweregrad\":\"niedrig\","
         "\"stelle_im_segment\":\"<exakter Originalausschnitt>\","
-        "\"begruendung\":\"<ein Satz: welches Wort falsch geschrieben ist und warum>\","
-        "\"vorschlag\":\"<nur das korrigierte Wort, nicht der ganze Satz>\"}"
-        "]}"
+        "\"begruendung\":\"<warum der Fehler eindeutig ist>\","
+        "\"vorschlag\":\"<nur wenn eindeutig korrekt>\"}]}"
     )
     user = (
         f"DOKUMENTSEGMENT:\n{segment_text.strip()}\n\n"
-        "Melde nur eindeutige Rechtschreibfehler — keine Kommas, keine Grammatik, "
-        "keine Korrekturen in Anführungszeichen."
+        "Melde nur eindeutige formale Fehler. "
+        "Wenn du unsicher bist, gib keine Meldung aus."
     )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-
 
 def build_json_repair_messages(raw_reply: str, schema_name: str) -> List[Dict[str, str]]:
     system = (
@@ -982,96 +1206,205 @@ def parse_json_response(raw_reply: str) -> Dict[str, Any]:
     return {"errors": errors}
 
 
-def normalize_factual_errors(raw_errors: List[Any]) -> List[Dict[str, Any]]:
-    allowed_classes = {
-        "Inhaltlicher Fehler",
-        "Fehlende Information",
-        "Formaler Fehler",
-        "Veraltete Information",
-    }
-
+def normalize_factual_errors(raw_errors: List[Any], catalog: ErrorCatalog) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    allowed_main = catalog.allowed_main_labels
+    allowed_subs_by_main = catalog.allowed_subclasses_by_main_label
+    allowed_change = catalog.allowed_change_labels
+    allowed_severity = catalog.allowed_severity_labels
+
     for item in raw_errors:
         if not isinstance(item, dict):
             continue
 
-        fehlerklasse = str(
-            item.get("fehlerklasse")
-            or item.get("typ")
-            or item.get("fehlerkategorie")
-            or ""
-        ).strip()
+        hauptklasse  = str(item.get("hauptklasse")    or item.get("main_class")   or "").strip()
+        subklasse    = str(item.get("subklasse")       or item.get("subcategory")  or "").strip()
+        aenderungstyp= str(item.get("aenderungstyp")  or item.get("change_type")  or "").strip()
+        schweregrad  = str(item.get("schweregrad")     or item.get("severity")     or "").strip()
+        stelle       = str(item.get("stelle_im_segment") or item.get("stelle")     or "").strip()
+        begruendung  = str(item.get("begruendung")     or item.get("begründung")   or "").strip()
+        source_refs  = [str(x).strip() for x in item.get("source_refs", []) if str(x).strip()]
 
-        if fehlerklasse not in allowed_classes:
+        if hauptklasse not in allowed_main:
+            print(f"[DROP] hauptklasse {hauptklasse!r} not in {sorted(allowed_main)}")
             continue
-
-        stelle = str(
-            item.get("stelle_im_segment")
-            or item.get("stelle")
-            or item.get("stelle_im_dokument")
-            or ""
-        ).strip()
-
-        begruendung = str(
-            item.get("begruendung")
-            or item.get("begründung")
-            or ""
-        ).strip()
-
-        source_refs = [str(x).strip() for x in item.get("source_refs", []) if str(x).strip()]
+        if subklasse not in allowed_subs_by_main.get(hauptklasse, set()):
+            print(f"[DROP] subklasse {subklasse!r} not in {sorted(allowed_subs_by_main.get(hauptklasse, set()))}")
+            continue
+        if aenderungstyp not in allowed_change:
+            print(f"[DROP] aenderungstyp {aenderungstyp!r} not in {sorted(allowed_change)}")
+            continue
+        if schweregrad not in allowed_severity:
+            schweregrad = "mittel"
         if not source_refs:
+            print(f"[DROP] no source_refs for stelle={stelle!r}")
             continue
 
         out.append({
-            "fehlerklasse": fehlerklasse,
-            "stelle_im_segment": stelle,
-            "begruendung": begruendung,
-            "source_refs": source_refs,
+            "hauptklasse":      hauptklasse,
+            "subklasse":        subklasse,
+            "aenderungstyp":    aenderungstyp,
+            "schweregrad":      schweregrad,
+            "stelle_im_segment":stelle,
+            "begruendung":      begruendung,
+            "source_refs":      source_refs,
         })
+
     return out
 
 
-def normalize_language_errors(raw_errors: List[Any]) -> List[Dict[str, Any]]:
-    allowed_classes = {"Rechtschreibung", "Grammatik", "Stil"}
-
+def normalize_language_errors(raw_errors: List[Any], catalog: ErrorCatalog) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    allowed_subs = catalog.allowed_subclasses_by_main_label.get("Formales", set())
+
+    legacy_to_new = {
+        "Rechtschreibung": "Redaktionelle Korrektur",
+        "Grammatik": "Redaktionelle Korrektur",
+        "Kommafehler": "Redaktionelle Korrektur",
+        "Stil": "Stil / Redundanz",
+    }
+
     for item in raw_errors:
         if not isinstance(item, dict):
             continue
 
-        fehlerklasse = str(
-            item.get("fehlerklasse")
-            or item.get("typ")
-            or ""
-        ).strip()
+        subklasse = str(item.get("subklasse") or item.get("fehlerklasse") or "Redaktionelle Korrektur").strip()
+        subklasse = legacy_to_new.get(subklasse, subklasse)
 
-        if fehlerklasse not in allowed_classes:
+        if subklasse not in allowed_subs:
             continue
 
-        stelle = str(
-            item.get("stelle_im_segment")
-            or item.get("stelle")
-            or ""
-        ).strip()
+        aenderungstyp = str(item.get("aenderungstyp") or item.get("änderungstyp") or "Redaktionelle Korrektur").strip()
+        if aenderungstyp not in catalog.allowed_change_labels:
+            aenderungstyp = "Redaktionelle Korrektur"
 
-        begruendung = str(
-            item.get("begruendung")
-            or item.get("begründung")
-            or ""
-        ).strip()
-
-        vorschlag = str(item.get("vorschlag") or "").strip()
+        schweregrad = str(item.get("schweregrad") or item.get("fehlerschwere") or "niedrig").strip()
+        if schweregrad not in catalog.allowed_severity_labels:
+            schweregrad = "niedrig"
 
         out.append({
-            "fehlerklasse": fehlerklasse,
-            "stelle_im_segment": stelle,
-            "begruendung": begruendung,
-            "vorschlag": vorschlag,
+            "hauptklasse": "Formales",
+            "subklasse": subklasse,
+            "aenderungstyp": aenderungstyp,
+            "schweregrad": schweregrad,
+            "stelle_im_segment": str(item.get("stelle_im_segment") or item.get("stelle") or "").strip(),
+            "begruendung": str(item.get("begruendung") or item.get("begründung") or "").strip(),
+            "vorschlag": str(item.get("vorschlag") or "").strip(),
         })
     return out
 
 
 # ── Document segmentation ─────────────────────────────────────────────────────
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[\.!?…])(?:[\]\)\"'»”’]+)?\s+(?=(?:[A-ZÄÖÜ]|\d|[-–—•*]))"
+)
+
+
+def _split_long_text_on_whitespace(text: str, *, target_chars: int, max_chars: int) -> List[str]:
+    s = " ".join((text or "").split())
+    if not s:
+        return []
+
+    parts: List[str] = []
+    remaining = s
+
+    while len(remaining) > max_chars:
+        hard_limit = min(len(remaining), max_chars)
+        preferred = min(len(remaining), target_chars)
+
+        cut = remaining.rfind(" ", 0, preferred + 1)
+        if cut < max(1, preferred // 2):
+            cut = remaining.rfind(" ", 0, hard_limit + 1)
+        if cut == -1:
+            cut = hard_limit
+
+        part = remaining[:cut].strip()
+        if part:
+            parts.append(part)
+
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        parts.append(remaining)
+
+    return parts
+
+
+def _split_paragraph_into_sentence_units(paragraph: str) -> List[str]:
+    para = (paragraph or "").strip()
+    if not para:
+        return []
+
+    if "\n" in para:
+        line_units = [line.strip() for line in para.splitlines() if line.strip()]
+        if len(line_units) > 1:
+            units: List[str] = []
+            for line in line_units:
+                units.extend(_split_paragraph_into_sentence_units(line))
+            return units
+
+    if re.match(r"^(?:[-*•]\s+|\d+[\.)]\s+)", para):
+        return [para]
+
+    pieces = re.split(_SENTENCE_SPLIT_RE, para)
+    units = [p.strip() for p in pieces if p and p.strip()]
+    return units or [para]
+
+
+def _split_paragraph_hierarchically(
+        paragraph: str,
+        *,
+        target_chars: int,
+        max_chars: int,
+) -> List[str]:
+    para = (paragraph or "").strip()
+    if not para:
+        return []
+
+    if len(para) <= max_chars:
+        return [para]
+
+    sentence_units = _split_paragraph_into_sentence_units(para)
+    if len(sentence_units) == 1 and sentence_units[0] == para:
+        return _split_long_text_on_whitespace(para, target_chars=target_chars, max_chars=max_chars)
+
+    chunks: List[str] = []
+    current: List[str] = []
+
+    def current_text() -> str:
+        return " ".join(current).strip()
+
+    def flush() -> None:
+        nonlocal current
+        joined = current_text()
+        if joined:
+            chunks.append(joined)
+        current = []
+
+    for unit in sentence_units:
+        unit = unit.strip()
+        if not unit:
+            continue
+
+        if len(unit) > max_chars:
+            if current:
+                flush()
+            chunks.extend(_split_long_text_on_whitespace(unit, target_chars=target_chars, max_chars=max_chars))
+            continue
+
+        candidate = " ".join(current + [unit]).strip() if current else unit
+        if current and len(candidate) > target_chars:
+            flush()
+
+        current.append(unit)
+
+        if len(current_text()) >= target_chars:
+            flush()
+
+    flush()
+    return chunks or [para]
+
 
 def split_document_into_segments(
         document_text: str,
@@ -1084,53 +1417,60 @@ def split_document_into_segments(
     if not text:
         return []
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     if not paragraphs:
         return [text]
 
+    atomic_units: List[str] = []
+    for para in paragraphs:
+        atomic_units.extend(
+            _split_paragraph_hierarchically(
+                para,
+                target_chars=target_chars,
+                max_chars=max_chars,
+            )
+        )
+
     segments: List[str] = []
     current: List[str] = []
-    current_len = 0
+
+    def current_segment() -> str:
+        return "\n\n".join(current).strip()
 
     def flush() -> None:
-        nonlocal current, current_len
-        if not current:
-            return
-        segment = "\n\n".join(current).strip()
-        if segment:
-            segments.append(segment)
+        nonlocal current
+        seg = current_segment()
+        if seg:
+            segments.append(seg)
         current = []
-        current_len = 0
 
-    for para in paragraphs:
-        para_len = len(para)
-
-        if para_len >= max_chars:
-            if current:
-                flush()
-            start = 0
-            while start < para_len:
-                end = min(para_len, start + target_chars)
-                chunk = para[start:end].strip()
-                if chunk:
-                    segments.append(chunk)
-                start = end
+    for unit in atomic_units:
+        unit = unit.strip()
+        if not unit:
             continue
 
-        candidate_len = current_len + (2 if current else 0) + para_len
-        if current and candidate_len > target_chars:
+        if len(unit) > max_chars:
+            if current:
+                flush()
+            segments.extend(_split_long_text_on_whitespace(unit, target_chars=target_chars, max_chars=max_chars))
+            continue
+
+        candidate = "\n\n".join(current + [unit]).strip() if current else unit
+        if current and len(candidate) > target_chars:
             flush()
 
-        current.append(para)
-        current_len = len("\n\n".join(current))
+        current.append(unit)
 
-        if current_len >= target_chars:
+        if len(current_segment()) >= target_chars:
             flush()
 
     flush()
 
     merged: List[str] = []
     for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
         if merged and len(seg) < min_chars:
             candidate = merged[-1] + "\n\n" + seg
             if len(candidate) <= max_chars:
@@ -1157,13 +1497,13 @@ def build_segment_evidences(
     evidences: List[SegmentEvidence] = []
     all_queries: List[str] = []
 
-    per_segment_candidate_k = max(6, min(max(args.top_k, 8), 24))
-    per_segment_rules_top_k = max(1, min(4, args.rules_top_k))
-    per_segment_material_top_k = max(1, min(4, args.material_top_k))
+    per_segment_candidate_k = args.per_segment_candidate_k
+    per_segment_rules_top_k = args.per_segment_rules_top_k
+    per_segment_material_top_k = args.per_segment_material_top_k
     per_segment_total_top_k = per_segment_rules_top_k + per_segment_material_top_k
 
     for seg_idx, segment in enumerate(segments, start=1):
-        hits, queries, rules_hits, material_hits = retrieve_multi_query(
+        _, queries, rules_hits, material_hits = retrieve_multi_query(
             segment,
             stores,
             embed_model=embed_model,
@@ -1172,9 +1512,9 @@ def build_segment_evidences(
             max_length=args.query_max_length,
             top_k=per_segment_total_top_k,
             candidate_k=per_segment_candidate_k,
-            multi_query_count=max(2, min(args.multi_query_count, 3)),
+            multi_query_count=args.multi_query_count,
             mmr_lambda=args.mmr_lambda,
-            max_per_source=max(1, args.max_per_source),
+            max_per_source=args.max_per_source,
             mode="segment",
             case_id=args.case_id,
             rules_top_k=per_segment_rules_top_k,
@@ -1183,10 +1523,14 @@ def build_segment_evidences(
 
         if vision_cfg and vision_cfg.get("vision_model"):
             rules_hits = enrich_hits_with_image_captions(
-                rules_hits, vision_cfg=vision_cfg, max_workers=args.vision_workers
+                rules_hits,
+                vision_cfg=vision_cfg,
+                max_workers=args.vision_workers,
             )
             material_hits = enrich_hits_with_image_captions(
-                material_hits, vision_cfg=vision_cfg, max_workers=args.vision_workers
+                material_hits,
+                vision_cfg=vision_cfg,
+                max_workers=args.vision_workers,
             )
 
         rules_sources = make_evidence_sources(rules_hits, ref_prefix=f"S{seg_idx}_R")
@@ -1214,6 +1558,7 @@ def run_factual_agent(
         evidence: SegmentEvidence,
         *,
         per_agent_context_chars: int,
+        catalog: ErrorCatalog,
 ) -> List[Dict[str, Any]]:
     rules_context = build_agent_context_from_sources(evidence.rules_sources, max_chars=per_agent_context_chars)
     material_context = build_agent_context_from_sources(evidence.material_sources, max_chars=per_agent_context_chars)
@@ -1222,8 +1567,10 @@ def run_factual_agent(
         evidence.segment_text,
         rules_context,
         material_context,
+        catalog,
     )
     raw_reply = llm.chat(messages)
+    print(f"[DEBUG] Factual agent S{evidence.segment_index} raw reply ({len(raw_reply)} chars): {raw_reply[:200]!r}")
 
     try:
         parsed = parse_json_response(raw_reply)
@@ -1232,13 +1579,13 @@ def run_factual_agent(
         repaired = llm.chat(repair_messages)
         parsed = parse_json_response(repaired)
 
-    findings = normalize_factual_errors(parsed.get("errors", []))
+    findings = normalize_factual_errors(parsed.get("errors", []), catalog)
     for f in findings:
         f["segment_index"] = evidence.segment_index
     return findings
 
 
-def run_language_agent(llm: LLMClient, evidence: SegmentEvidence) -> List[Dict[str, Any]]:
+def run_language_agent(llm: LLMClient, evidence: SegmentEvidence, *, catalog: ErrorCatalog) -> List[Dict[str, Any]]:
     messages = build_language_review_messages(evidence.segment_text)
     raw_reply = llm.chat(messages)
 
@@ -1249,13 +1596,14 @@ def run_language_agent(llm: LLMClient, evidence: SegmentEvidence) -> List[Dict[s
         repaired = llm.chat(repair_messages)
         parsed = parse_json_response(repaired)
 
-    findings = normalize_language_errors(parsed.get("errors", []))
+    findings = normalize_language_errors(parsed.get("errors", []), catalog)
     findings = filter_language_findings_by_exact_span(findings, evidence.segment_text)
     findings = filter_language_findings_by_plausibility(findings)
 
     for f in findings:
         f["segment_index"] = evidence.segment_index
     return findings
+
 
 def filter_language_findings_by_exact_span(
         findings: List[Dict[str, Any]],
@@ -1275,10 +1623,33 @@ def filter_language_findings_by_exact_span(
 
     return kept
 
+
 def filter_language_findings_by_plausibility(
         findings: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
+
+    def _normalize_eszett(s: str) -> str:
+        return s.replace("ß", "ss").lower()
+
+    def _tokenize(s: str) -> List[str]:
+        return re.findall(r"[A-Za-zÄÖÜäöüß0-9\-]+|[^\w\s]", s, flags=re.UNICODE)
+
+    def _looks_like_named_entity(s: str) -> bool:
+        tokens = re.findall(r"[A-Za-zÄÖÜäöüß0-9\-]+", s)
+        if not tokens:
+            return False
+        if len(tokens) <= 3 and any(t[:1].isupper() for t in tokens):
+            return True
+        if any(t.isupper() and len(t) >= 2 for t in tokens):
+            return True
+        return False
+
+    def _is_minor_article_insertion(stelle: str, vorschlag: str) -> bool:
+        s_tokens = _tokenize(stelle)
+        v_tokens = _tokenize(vorschlag)
+        added = [t for t in v_tokens if t not in s_tokens]
+        return all(t.lower() in {"der", "die", "das", "dem", "den", "des", "ein", "eine", "einer", "einem", "einen"} for t in added) and len(added) <= 2
 
     for item in findings:
         stelle = str(item.get("stelle_im_segment") or "").strip()
@@ -1287,40 +1658,39 @@ def filter_language_findings_by_plausibility(
 
         if not stelle:
             continue
-
-        # Reject if suggestion is identical to original
         if vorschlag and vorschlag == stelle:
             continue
-
-        # Reject "missing period" claims when sentence already ends with punctuation
-        if (
-                ("punkt" in begruendung or "abschlusspunkt" in begruendung)
-                and stelle.endswith((".", "!", "?"))
-        ):
+        if ("punkt" in begruendung or "abschlusspunkt" in begruendung) and stelle.endswith((".", "!", "?")):
+            continue
+        if any(q in stelle for q in ("«", "»", "„", "“", "‚", "‘")):
             continue
 
-        # Reject any correction that touches quoted text
-        if any(q in stelle for q in ("«", "»", "„", "\"", "‚", "'")):
+        # Schweizer ss/ß
+        if _normalize_eszett(stelle) == _normalize_eszett(vorschlag):
             continue
 
-        # Reject corrections where the only change is punctuation
-        stelle_stripped = re.sub(r"[,;:\-–—]", "", stelle).strip()
-        vorschlag_stripped = re.sub(r"[,;:\-–—]", "", vorschlag).strip()
-        if stelle_stripped == vorschlag_stripped:
+        # keine Eigennamen-/Bezeichnungs-Normalisierung
+        if _looks_like_named_entity(stelle):
             continue
 
-        # Reject if begruendung is only about commas or grammar
-        comma_keywords = {"komma", "kommata", "kommasetzung", "grammatik",
-                          "satzbau", "artikel", "tempus", "wortstellung", "stil"}
-        if any(kw in begruendung for kw in comma_keywords):
+        # keine weichen Stilkorrekturen
+        if "konsistent" in begruendung or "konsistenter gebrauch" in vorschlag.lower():
             continue
+
+        # keine Mini-Artikel-Ergänzungen ohne klaren Fehler
+        if vorschlag and _is_minor_article_insertion(stelle, vorschlag):
+            continue
+
+        # keine aggressiven Wortersetzungen bei kurzen Phrasen
+        if len(stelle.split()) <= 3 and len(vorschlag.split()) <= 3:
+            if stelle.lower() != vorschlag.lower():
+                # nur akzeptieren, wenn Begründung klar Orthografie/Grammatik nennt
+                if not any(x in begruendung for x in ["orthograf", "rechtschreib", "grammatik", "zeichensetzung", "komma"]):
+                    continue
 
         kept.append(item)
 
     return kept
-
-
-
 
 # ── Final Aggregator ──────────────────────────────────────────────────────────
 
@@ -1344,8 +1714,8 @@ def aggregate_reports(
         documents: List[str] = []
         source_details: List[Dict[str, Any]] = []
 
-        seen_chunks: set[str] = set()
-        seen_docs: set[str] = set()
+        seen_chunks: Set[str] = set()
+        seen_docs: Set[str] = set()
 
         for ref in refs:
             src = source_map[ref]
@@ -1367,7 +1737,10 @@ def aggregate_reports(
 
         aggregated_factual.append({
             "segment_index": item.get("segment_index"),
-            "fehlerklasse": item.get("fehlerklasse", ""),
+            "hauptklasse": item.get("hauptklasse", ""),
+            "subklasse": item.get("subklasse", ""),
+            "aenderungstyp": item.get("aenderungstyp", ""),
+            "schweregrad": item.get("schweregrad", ""),
             "stelle_im_segment": item.get("stelle_im_segment", ""),
             "begruendung": item.get("begruendung", ""),
             "source_refs": refs,
@@ -1394,7 +1767,10 @@ def render_combined_report(report: Dict[str, Any]) -> str:
         lines.append("Kein fachlicher Fehler gefunden.")
     else:
         for i, item in enumerate(factual, start=1):
-            lines.append(f"{i}. [{item.get('fehlerklasse') or 'Unklassifiziert'}]")
+            label = f"{item.get('hauptklasse') or 'Unklassifiziert'} > {item.get('subklasse') or 'Unklassifiziert'}"
+            lines.append(f"{i}. [{label}]")
+            lines.append(f"   Änderungstyp: {item.get('aenderungstyp') or '-'}")
+            lines.append(f"   Schweregrad: {item.get('schweregrad') or '-'}")
             lines.append(f"   Segment: {item.get('segment_index')}")
             lines.append(f"   Stelle im Segment: {item.get('stelle_im_segment') or '-'}")
             lines.append(f"   Begründung: {item.get('begruendung') or '-'}")
@@ -1410,7 +1786,10 @@ def render_combined_report(report: Dict[str, Any]) -> str:
         lines.append("Kein sprachlicher Fehler gefunden.")
     else:
         for i, item in enumerate(language, start=1):
-            lines.append(f"{i}. [{item.get('fehlerklasse') or 'Unklassifiziert'}]")
+            label = f"{item.get('hauptklasse') or 'Unklassifiziert'} > {item.get('subklasse') or 'Unklassifiziert'}"
+            lines.append(f"{i}. [{label}]")
+            lines.append(f"   Änderungstyp: {item.get('aenderungstyp') or '-'}")
+            lines.append(f"   Schweregrad: {item.get('schweregrad') or '-'}")
             lines.append(f"   Segment: {item.get('segment_index')}")
             lines.append(f"   Stelle im Segment: {item.get('stelle_im_segment') or '-'}")
             lines.append(f"   Begründung: {item.get('begruendung') or '-'}")
@@ -1521,6 +1900,7 @@ def check_document(
         llm: LLMClient,
         args: argparse.Namespace,
         vision_cfg: Optional[dict],
+        catalog: ErrorCatalog,
 ) -> None:
     try:
         from importDocuments_structural import normalize_text, read_docx
@@ -1539,7 +1919,6 @@ def check_document(
 
     print(f"[INFO] Document text: {len(doc_text)} chars")
 
-    # Agent 1: build evidence per segment
     evidences, multi_queries = build_segment_evidences(
         doc_text,
         stores,
@@ -1616,11 +1995,10 @@ def check_document(
                 max_chars=max(1000, args.context_max_chars // 3),
             ) or "(leer)")
 
-    # Agent 2 + 3
     factual_findings: List[Dict[str, Any]] = []
     language_findings: List[Dict[str, Any]] = []
 
-    per_agent_context_chars = max(1200, args.context_max_chars // 3)
+    per_agent_context_chars = max(30000, args.context_max_chars // 3)
 
     for ev in evidences:
         try:
@@ -1629,19 +2007,27 @@ def check_document(
                     llm,
                     ev,
                     per_agent_context_chars=per_agent_context_chars,
+                    catalog=catalog,
                 )
             )
         except Exception as e:
             print(f"[WARN] Factual agent failed for segment {ev.segment_index}: {e}")
 
         try:
-            language_findings.extend(run_language_agent(llm, ev))
+            language_findings.extend(run_language_agent(llm, ev, catalog=catalog))
         except Exception as e:
             print(f"[WARN] Language agent failed for segment {ev.segment_index}: {e}")
 
-    # Final aggregator
     report = aggregate_reports(evidences, factual_findings, language_findings)
     rendered_report = render_combined_report(report)
+
+    if args.save_predictions_jsonl:
+        save_predictions_jsonl(
+            report=report,
+            case_id=args.case_id,
+            output_path=Path(args.save_predictions_jsonl),
+            catalog=catalog,
+        )
 
     print("\n" + "=" * 90)
     print(f"ERROR DETECTION REPORT — {doc_path.name}")
@@ -1654,7 +2040,7 @@ def check_document(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
-            "RAG pipeline with dual-store retrieval and 3-agent document checking.\n\n"
+            "RAG pipeline with dual-store retrieval, taxonomy loaded from JSON, and 3-agent document checking.\n\n"
             "Modes:\n"
             "  --question TEXT   Answer a free-text question\n"
             "  (no args)         Interactive Q&A loop\n"
@@ -1685,6 +2071,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=env_str("CASE_ID", ""),
         help="Case ID for filtering case materials, e.g. case_01",
+    )
+    ap.add_argument(
+        "--taxonomy_json",
+        type=str,
+        default=env_str("TAXONOMY_JSON", "taxonomy.json"),
+        help="Path to taxonomy JSON",
     )
 
     ap.add_argument("--embeddings", type=str,
@@ -1750,6 +2142,32 @@ def parse_args() -> argparse.Namespace:
                     help="Print sources metadata as JSON")
     ap.add_argument("--print_context", action="store_true",
                     help="Print segment texts and evidence blocks")
+    ap.add_argument(
+    "--save_predictions_jsonl",
+        type=str,
+        default="",
+        help="Path to save structured predictions JSONL"
+    )
+    ap.add_argument(
+        "--per_segment_candidate_k",
+        type=int,
+        default=env_int("PER_SEGMENT_CANDIDATE_K", ""),
+        help="Candidate pool size per document segment",
+    )
+
+    ap.add_argument(
+        "--per_segment_rules_top_k",
+        type=int,
+        default=env_int("PER_SEGMENT_RULES_TOP_K", ""),
+        help="Final number of rule chunks kept per segment",
+    )
+
+    ap.add_argument(
+        "--per_segment_material_top_k",
+        type=int,
+        default=env_int("PER_SEGMENT_MATERIAL_TOP_K", ""),
+        help="Final number of material chunks kept per segment",
+    )
 
     return ap.parse_args()
 
@@ -1763,6 +2181,12 @@ def main() -> None:
 
     try:
         args = parse_args()
+        catalog = load_taxonomy_json(Path(args.taxonomy_json).resolve())
+        print(
+            f"[INFO] Loaded taxonomy: {len(catalog.main_classes)} Hauptklassen | "
+            f"{sum(len(v) for v in catalog.sub_by_main.values())} Subklassen | "
+            f"{len(catalog.change_types)} Änderungstypen"
+        )
 
         stores: List[RagStore] = [
             load_rag_store(
@@ -1794,15 +2218,24 @@ def main() -> None:
         llm = make_llm_client()
 
         vision_cfg: Optional[dict] = None
-        if args.vision_model.strip():
+        vision_model_enabled = env_bool("VISION_MODEL_ENABLED", True)
+
+
+        if args.vision_model.strip() and vision_model_enabled:
             vision_cfg = {
                 "vision_model": args.vision_model,
-                "ollama_base_url": env_str("OLLAMA_BASE_URL", "http://localhost:11434"),
+                "vision_model_enabled": vision_model_enabled,
+                "vision_prompt": env_str("VISION_PROMPT", ""),
+                "ollama_base_url": require_env("OLLAMA_BASE_URL"),
                 "vision_timeout_s": args.vision_timeout_s,
+                "vision_options": env_json_object_optional("VISION_OPTIONS_JSON"),
             }
             print(f"[INFO] Vision captioning enabled: {args.vision_model}")
         else:
-            print("[INFO] Vision captioning disabled (no --vision_model set).")
+            print(
+                f"[INFO] Vision captioning disabled: "
+                f"vision_model={args.vision_model!r}, vision_model_enabled={vision_model_enabled}"
+            )
 
         print(
             f"[INFO] Retrieval: multi_query_count={args.multi_query_count} | "
@@ -1818,6 +2251,7 @@ def main() -> None:
             llm=llm,
             args=args,
             vision_cfg=vision_cfg,
+            catalog=catalog,
         )
 
         if args.document.strip():
@@ -1832,7 +2266,7 @@ def main() -> None:
             return
 
         if args.question.strip():
-            answer(args.question, **shared)
+            answer(args.question, stores=stores, embed_model=embed_model, embed_tok=embed_tok, device=device, llm=llm, args=args, vision_cfg=vision_cfg)
             return
 
         print("Interactive RAG. Empty input to exit.")
@@ -1840,7 +2274,7 @@ def main() -> None:
             q = input("\nQuestion> ").strip()
             if not q:
                 break
-            answer(q, **shared)
+            answer(q, stores=stores, embed_model=embed_model, embed_tok=embed_tok, device=device, llm=llm, args=args, vision_cfg=vision_cfg)
 
     finally:
         ended_at = datetime.now()

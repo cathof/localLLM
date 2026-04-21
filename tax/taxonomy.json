@@ -1,0 +1,176 @@
+{
+  "version": "1.0.0",
+  "description": "Verbindliche Taxonomie für die LLM-basierte Dokumentenprüfung",
+  "main_classes": [
+    {
+      "id": "QMQS",
+      "label": "QM/QS-Konformität",
+      "subclasses": [
+        {
+          "id": "QMQS_STRUKTUR",
+          "label": "Strukturvorgaben",
+          "description": "Vorgeschriebene Kapitelstruktur oder Reihenfolge nicht eingehalten"
+        },
+        {
+          "id": "QMQS_DOKPFLICHT",
+          "label": "Dokumentationspflicht",
+          "description": "Pflichtangaben fehlen oder sind unvollständig"
+        },
+        {
+          "id": "QMQS_TERMINO",
+          "label": "Terminologie (normativ)",
+          "description": "Begriffe entsprechen nicht internen Vorgaben"
+        },
+        {
+          "id": "QMQS_NACHVOLLZIEHBARKEIT",
+          "label": "Nachvollziehbarkeit / Prozess",
+          "description": "Untersuchung oder Freigabe nicht dokumentiert"
+        }
+      ]
+    },
+    {
+      "id": "RECHT",
+      "label": "Rechtskonformität",
+      "subclasses": [
+        {
+          "id": "RECHT_ABSICHERUNG",
+          "label": "Aussageabsicherung",
+          "description": "Aussagen sind zu absolut oder nicht abgesichert"
+        },
+        {
+          "id": "RECHT_TRENNUNG",
+          "label": "Trennung Befund/Bewertung",
+          "description": "Interpretation wird als Tatsache dargestellt"
+        },
+        {
+          "id": "RECHT_SCHLUSS",
+          "label": "Problematische Schlussfolgerung",
+          "description": "Schlussfolgerung nicht ausreichend begründet"
+        },
+        {
+          "id": "RECHT_VERANTWORTUNG",
+          "label": "Verantwortungszuschreibung",
+          "description": "Zuständigkeit unklar oder falsch"
+        }
+      ]
+    },
+    {
+      "id": "STRUKT",
+      "label": "Struktur und Argumentation",
+      "subclasses": [
+        {
+          "id": "STRUKT_ARGUMENTATION",
+          "label": "Argumentationsstruktur",
+          "description": "Logik oder Aufbau der Argumentation unklar"
+        },
+        {
+          "id": "STRUKT_EVIDENZ",
+          "label": "Evidenz / Belege",
+          "description": "Aussagen nicht ausreichend gestützt"
+        },
+        {
+          "id": "STRUKT_BEFUND_BESCHREIBUNG",
+          "label": "Beschreibung von Befunden",
+          "description": "Sachverhalt unpräzise beschrieben"
+        },
+        {
+          "id": "STRUKT_REFERENZ",
+          "label": "Referenzpräzisierung",
+          "description": "Bezug im Text unklar"
+        },
+        {
+          "id": "STRUKT_DOK_BEFUND",
+          "label": "Dokumentation von Befunden",
+          "description": "Befunde unzureichend dargestellt"
+        },
+        {
+          "id": "STRUKT_ERWEITERUNG_EVIDENZ",
+          "label": "Erweiterung der Evidenz",
+          "description": "zusätzliche Belege oder Details ergänzt"
+        },
+        {
+          "id": "STRUKT_METHODIK",
+          "label": "Methodische Beschreibung",
+          "description": "Methode unklar oder falsch dargestellt"
+        }
+      ]
+    },
+    {
+      "id": "FORMALES",
+      "label": "Formales",
+      "subclasses": [
+        {
+          "id": "FORMALES_REDAKTION",
+          "label": "Redaktionelle Korrektur",
+          "description": "sprachliche Fehler ohne Einfluss auf Inhalt"
+        },
+        {
+          "id": "FORMALES_STIL",
+          "label": "Stil / Redundanz",
+          "description": "unnötige oder doppelte Formulierungen"
+        },
+        {
+          "id": "FORMALES_REFERENZEN",
+          "label": "Referenzen (formal)",
+          "description": "formale Ungenauigkeit bei Verweisen"
+        },
+        {
+          "id": "FORMALES_STRUKTUR",
+          "label": "Dokumentstruktur",
+          "description": "formale Strukturprobleme"
+        },
+        {
+          "id": "FORMALES_ADRESSIERUNG",
+          "label": "Adressierung",
+          "description": "falsche oder fehlende Anrede"
+        }
+      ]
+    }
+  ],
+  "change_types": [
+    {
+      "id": "CHANGE_REDAKTION",
+      "label": "Redaktionelle Korrektur",
+      "description": "sprachliche oder formale Verbesserung"
+    },
+    {
+      "id": "CHANGE_FACHLICH",
+      "label": "Fachliche Präzisierung",
+      "description": "genauere Beschreibung eines Sachverhalts"
+    },
+    {
+      "id": "CHANGE_EVIDENZ",
+      "label": "Evidenzergänzung",
+      "description": "neue Quellen oder Belege"
+    },
+    {
+      "id": "CHANGE_ARGUMENTATION",
+      "label": "Erweiterung der Argumentation",
+      "description": "ausführlichere Begründung"
+    },
+    {
+      "id": "CHANGE_STRUKTUR",
+      "label": "Strukturverbesserung",
+      "description": "bessere Organisation des Dokuments"
+    },
+    {
+      "id": "CHANGE_NORMATIV",
+      "label": "Normativer Mangel",
+      "description": "Verstoss gegen QM/QS-Vorgaben"
+    }
+  ],
+  "severity_levels": [
+    {
+      "id": "LOW",
+      "label": "niedrig"
+    },
+    {
+      "id": "MEDIUM",
+      "label": "mittel"
+    },
+    {
+      "id": "HIGH",
+      "label": "hoch"
+    }
+  ]
+}

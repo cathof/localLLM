@@ -23,12 +23,6 @@ logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
-#
-# PDF text extraction:  pdfplumber (primary)  +  PyMuPDF fallback
-# PDF image extraction: PyMuPDF only (pdfplumber has no image API)
-# OCR:                  Tesseract via pytesseract (lazy, only for scanned pages)
-#
-# Removed: pdf2image, pypdf  – both superseded by the libraries above
 
 try:
     import pdfplumber  # pip install pdfplumber
@@ -37,6 +31,7 @@ except Exception:
 
 try:
     import fitz  # pip install PyMuPDF
+    fitz.TOOLS.mupdf_display_errors(False)
 except Exception:
     fitz = None  # type: ignore
 
@@ -44,7 +39,7 @@ try:
     import pytesseract  # pip install pytesseract
     from pytesseract import image_to_string
 except Exception:
-    pytesseract     = None  # type: ignore
+    pytesseract = None  # type: ignore
     image_to_string = None  # type: ignore
 
 try:
@@ -55,12 +50,12 @@ try:
     from docx.table import Table, _Cell
     from docx.text.paragraph import Paragraph
 except Exception:
-    Document  = None  # type: ignore
+    Document = None  # type: ignore
     _Document = None  # type: ignore
-    CT_Tbl    = None  # type: ignore
-    CT_P      = None  # type: ignore
-    Table     = None  # type: ignore
-    _Cell     = None  # type: ignore
+    CT_Tbl = None  # type: ignore
+    CT_P = None  # type: ignore
+    Table = None  # type: ignore
+    _Cell = None  # type: ignore
     Paragraph = None  # type: ignore
 
 try:
@@ -107,17 +102,20 @@ def env_str(key: str, default: str) -> str:
     v = os.environ.get(key)
     return v if v is not None and v.strip() != "" else default
 
+
 def env_int(key: str, default: int) -> int:
     v = os.environ.get(key)
     if v is None or v.strip() == "":
         return default
     return int(v)
 
+
 def env_float(key: str, default: float) -> float:
     v = os.environ.get(key)
     if v is None or v.strip() == "":
         return default
     return float(v)
+
 
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.environ.get(key)
@@ -131,16 +129,17 @@ load_dotenv(".env")
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
-DATA_DIR_DEFAULT        = env_str("DATA_DIR",        "./data")
-OUT_JSONL_DEFAULT       = env_str("OUT_JSONL",       "prepared.jsonl")
+DATA_DIR_DEFAULT = env_str("DATA_DIR", "./data")
+CASES_DIR_DEFAULT = env_str("CASES_DIR", "")
+OUT_JSONL_DEFAULT = env_str("OUT_JSONL", "prepared_rules.jsonl")
 IMAGE_CACHE_DIR_DEFAULT = env_str("IMAGE_CACHE_DIR", "./image_cache")
 
-CHUNK_SIZE_TOKENS_DEFAULT    = env_int("CHUNK_SIZE_TOKENS",    320)
-CHUNK_OVERLAP_TOKENS_DEFAULT = env_int("CHUNK_OVERLAP_TOKENS",  48)
-MIN_CHUNK_TOKENS_DEFAULT     = env_int("MIN_CHUNK_TOKENS",       80)
+CHUNK_SIZE_TOKENS_DEFAULT = env_int("CHUNK_SIZE_TOKENS", 320)
+CHUNK_OVERLAP_TOKENS_DEFAULT = env_int("CHUNK_OVERLAP_TOKENS", 48)
+MIN_CHUNK_TOKENS_DEFAULT = env_int("MIN_CHUNK_TOKENS", 80)
 
 TOKENIZER_BACKEND_DEFAULT = env_str("TOKENIZER_BACKEND", "auto")
-TOKENIZER_MODEL_DEFAULT   = env_str("TOKENIZER_MODEL",   "cl100k_base")
+TOKENIZER_MODEL_DEFAULT = env_str("TOKENIZER_MODEL", "cl100k_base")
 
 ENABLE_SECTION_AWARENESS_DEFAULT = env_bool("ENABLE_SECTION_AWARENESS", True)
 ENABLE_SEMANTIC_CHUNKING_DEFAULT = env_bool("ENABLE_SEMANTIC_CHUNKING", True)
@@ -148,36 +147,30 @@ SEMANTIC_MODEL_DEFAULT = env_str(
     "SEMANTIC_MODEL",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 )
-# 0.35 (down from 0.42): less aggressive splitting in coherent technical prose
-SEMANTIC_THRESHOLD_DEFAULT  = env_float("SEMANTIC_THRESHOLD", 0.35)
-SEMANTIC_MIN_UNITS_DEFAULT  = env_int("SEMANTIC_MIN_UNITS", 2)
+SEMANTIC_THRESHOLD_DEFAULT = env_float("SEMANTIC_THRESHOLD", 0.35)
+SEMANTIC_MIN_UNITS_DEFAULT = env_int("SEMANTIC_MIN_UNITS", 2)
 
-ENABLE_OCR_DEFAULT             = env_bool("ENABLE_OCR",               False)
-ENABLE_OCR_PPTX_DEFAULT        = env_bool("ENABLE_OCR_PPTX",          False)
-OCR_LANG_DEFAULT               = env_str ("OCR_LANG",                 "deu")
-OCR_MIN_CHARS_PER_PAGE_DEFAULT = env_int ("OCR_MIN_CHARS_PER_PAGE",     80)
-OCR_DPI_DEFAULT                = env_int ("OCR_DPI",                   300)
+ENABLE_OCR_DEFAULT = env_bool("ENABLE_OCR", False)
+ENABLE_OCR_PPTX_DEFAULT = env_bool("ENABLE_OCR_PPTX", False)
+OCR_LANG_DEFAULT = env_str("OCR_LANG", "deu")
+OCR_MIN_CHARS_PER_PAGE_DEFAULT = env_int("OCR_MIN_CHARS_PER_PAGE", 80)
+OCR_DPI_DEFAULT = env_int("OCR_DPI", 300)
 
-# PyMuPDF image-extraction thresholds
 FULL_PAGE_IMAGE_RATIO_DEFAULT = env_float("FULL_PAGE_IMAGE_RATIO", 0.85)
-MIN_IMAGE_PX_DEFAULT          = env_int  ("MIN_IMAGE_PX",           100)
+MIN_IMAGE_PX_DEFAULT = env_int("MIN_IMAGE_PX", 100)
+VISION_PAGE_RENDER_DPI_DEFAULT = env_int("VISION_PAGE_RENDER_DPI", 150)
+PDF_TEXT_EXTRACTOR_DEFAULT = env_str("PDF_TEXT_EXTRACTOR", "pymupdf_first").strip().lower()
+PDF_SUSPICIOUS_RUN_LEN_DEFAULT = env_int("PDF_SUSPICIOUS_RUN_LEN", 28)
 
 TESSERACT_CMD_DEFAULT = os.environ.get("TESSERACT_CMD")
-TESSDATA_DIR_DEFAULT  = os.environ.get("TESSDATA_DIR")
-SOFFICE_CMD_DEFAULT   = os.environ.get("SOFFICE_CMD")
+TESSDATA_DIR_DEFAULT = os.environ.get("TESSDATA_DIR")
+SOFFICE_CMD_DEFAULT = os.environ.get("SOFFICE_CMD")
 
-# ── Vision constants – INFERENCE TIME only, not used during ingestion ─────────
-#
-# ollama_caption_png() is kept here as a shared utility so the query /
-# error-detection pipeline can import it without a separate module.
-# It is never called inside the ingestion path.
-
-OLLAMA_BASE_URL_DEFAULT  = env_str("OLLAMA_BASE_URL",  "http://localhost:11434")
-VISION_BACKEND_DEFAULT   = env_str("VISION_BACKEND",   "ollama")
-VISION_MODEL_DEFAULT     = env_str("VISION_MODEL",     "qwen2.5vl:7b")
+OLLAMA_BASE_URL_DEFAULT = env_str("OLLAMA_BASE_URL", "http://localhost:11434")
+VISION_BACKEND_DEFAULT = env_str("VISION_BACKEND", "ollama")
+VISION_MODEL_DEFAULT = env_str("VISION_MODEL", "qwen2.5vl:7b")
 VISION_TIMEOUT_S_DEFAULT = env_int("VISION_TIMEOUT_S", 180)
 
-# Prompt for PPTX slides (inference time)
 VISION_PROMPT_SLIDE_DEFAULT = env_str(
     "VISION_PROMPT_SLIDE",
     (
@@ -190,7 +183,6 @@ VISION_PROMPT_SLIDE_DEFAULT = env_str(
     ),
 )
 
-# Prompt for PDF figures / charts (inference time)
 VISION_PROMPT_FIGURE_DEFAULT = env_str(
     "VISION_PROMPT_FIGURE",
     (
@@ -203,7 +195,7 @@ VISION_PROMPT_FIGURE_DEFAULT = env_str(
     ),
 )
 
-LOG_LEVEL_DEFAULT   = env_str("LOG_LEVEL",  "INFO").upper()
+LOG_LEVEL_DEFAULT = env_str("LOG_LEVEL", "INFO").upper()
 LOG_EVERY_S_DEFAULT = env_int("LOG_EVERY_S", 10)
 
 
@@ -220,7 +212,7 @@ def log(
         cfg: Optional[dict] = None,
         err: bool = False,
 ) -> None:
-    cfg  = cfg or {}
+    cfg = cfg or {}
     want = _lvl(str(cfg.get("log_level") or LOG_LEVEL_DEFAULT))
     have = _lvl(level)
     if have < want:
@@ -233,7 +225,7 @@ def log(
 class RunStats:
     t0: float
     last_heartbeat: float
-    files:   int = 0
+    files: int = 0
     records: int = 0
 
 
@@ -241,7 +233,7 @@ def heartbeat(st: RunStats, *, cfg: dict, extra: str = "") -> None:
     every_s = int(cfg.get("log_every_s") or LOG_EVERY_S_DEFAULT)
     now = time.time()
     if now - st.last_heartbeat >= every_s:
-        dt   = now - st.t0
+        dt = now - st.t0
         tail = f" {extra}".rstrip()
         log(f"heartbeat t={dt:.0f}s files={st.files} records={st.records}{tail}", cfg=cfg)
         st.last_heartbeat = now
@@ -251,15 +243,15 @@ def heartbeat(st: RunStats, *, cfg: dict, extra: str = "") -> None:
 
 @dataclass(frozen=True)
 class ChunkRecord:
-    id:       str
-    text:     str
+    id: str
+    text: str
     metadata: dict
 
 
 @dataclass(frozen=True)
 class Section:
     title: str
-    body:  str
+    body: str
     level: int = 0
 
 
@@ -274,8 +266,17 @@ class StructuralUnit:
 
 @dataclass(frozen=True)
 class RuntimeResources:
-    token_counter:    "TokenCounter"
+    token_counter: "TokenCounter"
     semantic_encoder: "SemanticEncoder"
+
+
+@dataclass(frozen=True)
+class SourceContext:
+    source_root: Path
+    source_kind: str          # "normbasis" | "case_material"
+    rel_path: str             # path relative to root, POSIX
+    case_id: Optional[str]    # e.g. "case_01" for case materials
+    document_type: Optional[str]
 
 
 # ── Helpers: hashing, metadata ────────────────────────────────────────────────
@@ -308,21 +309,58 @@ def stable_chunk_id(
 def build_metadata(path: Path, rel_path: str, text: str) -> dict:
     st = path.stat()
     return {
-        "source_path":     rel_path.replace("\\", "/"),
-        "source_name":     path.name,
-        "ext":             path.suffix.lower(),
-        "size_bytes":      st.st_size,
-        "mtime_utc":       datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        "source_path": rel_path.replace("\\", "/"),
+        "source_name": path.name,
+        "ext": path.suffix.lower(),
+        "size_bytes": st.st_size,
+        "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
         "ingested_at_utc": datetime.now(tz=timezone.utc).isoformat(),
-        "text_len":        len(text),
+        "text_len": len(text),
     }
+
+
+def infer_case_id_from_rel_path(rel_path: str) -> Optional[str]:
+    parts = Path(rel_path).parts
+    if not parts:
+        return None
+    first = parts[0]
+    if re.fullmatch(r"case[_\-]?\d+", first, flags=re.IGNORECASE):
+        return first
+    return None
+
+
+def infer_document_type(path: Path, rel_path: str, case_id: Optional[str], source_kind: str) -> Optional[str]:
+    if source_kind != "case_material":
+        return None
+
+    parts = Path(rel_path).parts
+
+    # Expected shape: case_01/<document_type>/file.ext
+    if case_id and len(parts) >= 2 and parts[0] == case_id:
+        candidate = parts[1].strip().lower()
+        if candidate and candidate not in {".converted"}:
+            return normalize_document_type(candidate)
+
+    # Fallback: infer from file name
+    stem = path.stem.strip().lower()
+    if not stem:
+        return "unknown"
+    return normalize_document_type(stem)
+
+
+def normalize_document_type(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9äöüß_\-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "unknown"
 
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
-_WHITESPACE_RE       = re.compile(r"[ \t\f\v]+")
-_MULTINEW_RE         = re.compile(r"\n{3,}")
+_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
+_MULTINEW_RE = re.compile(r"\n{3,}")
 _HYPHEN_LINEBREAK_RE = re.compile(r"(\w)-\n(\w)")
+_SOFT_LINEBREAK_WORD_RE = re.compile(r"([A-Za-zÄÖÜäöüß])\n([A-Za-zÄÖÜäöüß])")
 
 
 def normalize_text(text: str) -> str:
@@ -330,6 +368,7 @@ def normalize_text(text: str) -> str:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _HYPHEN_LINEBREAK_RE.sub(r"\1\2", text)
+    text = _SOFT_LINEBREAK_WORD_RE.sub(r"\1 \2", text)
     text = text.replace("\u00a0", " ").replace("\u2007", " ").replace("\u202f", " ")
     lines: list[str] = []
     for line in text.split("\n"):
@@ -345,10 +384,10 @@ def normalize_text(text: str) -> str:
 
 class TokenCounter:
     def __init__(self, cfg: dict):
-        self.backend           = str(cfg.get("tokenizer_backend") or TOKENIZER_BACKEND_DEFAULT).strip().lower()
-        self.model             = str(cfg.get("tokenizer_model")   or TOKENIZER_MODEL_DEFAULT).strip()
-        self._encoder          = None
-        self._tokenizer        = None
+        self.backend = str(cfg.get("tokenizer_backend") or TOKENIZER_BACKEND_DEFAULT).strip().lower()
+        self.model = str(cfg.get("tokenizer_model") or TOKENIZER_MODEL_DEFAULT).strip()
+        self._encoder = None
+        self._tokenizer = None
         self._resolved_backend = "simple"
         self._init_backend()
 
@@ -366,7 +405,7 @@ class TokenCounter:
                 pass
         if self.backend in {"auto", "transformers"} and AutoTokenizer is not None and self.model:
             try:
-                self._tokenizer        = AutoTokenizer.from_pretrained(self.model, use_fast=True)
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model, use_fast=True)
                 self._resolved_backend = "transformers"
                 return
             except Exception:
@@ -397,14 +436,14 @@ class TokenCounter:
 
 class SemanticEncoder:
     def __init__(self, cfg: dict):
-        self.enabled    = bool(cfg.get("enable_semantic_chunking", ENABLE_SEMANTIC_CHUNKING_DEFAULT))
+        self.enabled = bool(cfg.get("enable_semantic_chunking", ENABLE_SEMANTIC_CHUNKING_DEFAULT))
         self.model_name = str(cfg.get("semantic_model") or SEMANTIC_MODEL_DEFAULT).strip()
-        self._model     = None
-        self.available  = False
+        self._model = None
+        self.available = False
         if not self.enabled or SentenceTransformer is None:
             return
         try:
-            self._model    = SentenceTransformer(self.model_name)
+            self._model = SentenceTransformer(self.model_name)
             self.available = True
         except Exception:
             self.available = False
@@ -430,8 +469,8 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = na = nb = 0.0
     for x, y in zip(a, b):
         dot += x * y
-        na  += x * x
-        nb  += y * y
+        na += x * x
+        nb += y * y
     if na <= 0.0 or nb <= 0.0:
         return 0.0
     return dot / (math.sqrt(na) * math.sqrt(nb))
@@ -439,22 +478,39 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 # ── Section / sentence splitting ──────────────────────────────────────────────
 
-_MD_HEADER_RE      = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _NUMERIC_HEADER_RE = re.compile(r"^(?:\d+(?:\.\d+){0,4}|[A-Z])[\.\)]\s+.+$")
-_SECTION_WORD_RE   = re.compile(
+_SECTION_WORD_RE = re.compile(
     r"^(?:kapitel|chapter|abschnitt|section|teil|annex|anhang)\b", re.IGNORECASE
 )
-_BULLET_RE              = re.compile(r"^(?:[-*•]\s+|\d+[\.\)]\s+)")
-_SENTENCE_SPLIT_RE      = re.compile(r"(?<=[\.\!\?\:\;])\s+(?=[A-ZÄÖÜ0-9\"„«»])")
-_COLON_SUBHEADER_RE     = re.compile(r"^[A-ZÄÖÜ][^.!?]{0,120}:$")
-_SHORT_TITLEISH_RE      = re.compile(r"^[A-ZÄÖÜ0-9][^.!?]{0,100}$")
-_QUESTION_PREFIX_RE     = re.compile(r"^(?:frage|fragen)\b", re.IGNORECASE)
-_CHECKLIST_PREFIX_RE    = re.compile(r"^(?:checkliste|checklist|todo|to-do)\b", re.IGNORECASE)
-_LIST_CONTINUATION_RE   = re.compile(r"^(?:[a-zäöü0-9].{0,140}|[A-ZÄÖÜ].{0,140}\?)$")
-_PROCEDURE_PREFIX_RE    = re.compile(
+_BULLET_RE = re.compile(r"^(?:[-*•]\s+|\d+[\.\)]\s+)")
+
+_HEADING_STYLE_RE = re.compile(r"(?:überschrift|heading|kopf)\s*(\d+)", re.IGNORECASE)
+_LIST_STYLE_RE = re.compile(
+    r"(?:aufzählung|auflistung|listenabsatz|list(?:\s*(?:bullet|paragraph|number|absatz))?|bullet)",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?\:\;])\s+(?=[A-ZÄÖÜ0-9\"„«»])")
+_COLON_SUBHEADER_RE = re.compile(r"^[A-ZÄÖÜ][^.!?]{0,120}:$")
+_SHORT_TITLEISH_RE = re.compile(r"^[A-ZÄÖÜ0-9][^.!?]{0,100}$")
+_QUESTION_PREFIX_RE = re.compile(r"^(?:frage|fragen)\b", re.IGNORECASE)
+_CHECKLIST_PREFIX_RE = re.compile(r"^(?:checkliste|checklist|todo|to-do)\b", re.IGNORECASE)
+_LIST_CONTINUATION_RE = re.compile(r"^(?:[a-zäöü0-9].{0,140}|[A-ZÄÖÜ].{0,140}\?)$")
+_PROCEDURE_PREFIX_RE = re.compile(
     r"^(?:bei |vor |nach |während |zurück |anschliessend |danach |erste\b|weiteres\b)",
     re.IGNORECASE,
 )
+
+
+def _classify_paragraph_style(style_name: str) -> tuple[str, int]:
+    if not style_name:
+        return "paragraph", 0
+    m = _HEADING_STYLE_RE.search(style_name)
+    if m:
+        return "heading", int(m.group(1))
+    if _LIST_STYLE_RE.search(style_name):
+        return "list", 0
+    return "paragraph", 0
 
 
 def looks_like_header(line: str) -> tuple[bool, int, str]:
@@ -481,9 +537,7 @@ def looks_like_header(line: str) -> tuple[bool, int, str]:
         letters = [c for c in s if c.isalpha()]
         if letters:
             upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
-            titleish    = s == s.title()
-            # Require >= 2 words: prevents ALL-CAPS abbreviations like
-            # "ENTWURF" or "HINWEIS" from being mistaken for section headers.
+            titleish = s == s.title()
             if (upper_ratio > 0.8 and len(s.split()) >= 2) or titleish:
                 return True, 3, s
 
@@ -542,7 +596,7 @@ def split_into_sections(text: str, *, enable_section_awareness: bool) -> list[Se
     if not enable_section_awareness:
         return [Section(title="", body=text.strip(), level=0)] if text.strip() else []
 
-    lines         = text.split("\n")
+    lines = text.split("\n")
     sections: list[Section] = []
     current_title = ""
     current_level = 0
@@ -603,14 +657,6 @@ def split_into_sentences(text: str) -> list[str]:
 
 
 def split_section_into_structural_units(section: Section) -> list[StructuralUnit]:
-    """
-    Split one high-level section into smaller structural units.
-
-    Goals:
-      - preserve hierarchical sub-headings (e.g. "Zurück im FOR")
-      - keep list/question/checklist blocks together
-      - avoid mixing multiple process phases inside one large semantic chunk
-    """
     raw_lines = [ln.rstrip() for ln in section.body.split("\n")]
     units: list[StructuralUnit] = []
 
@@ -703,6 +749,7 @@ def split_section_into_structural_units(section: Section) -> list[StructuralUnit
         )
     return units
 
+
 # ── Token-based splitting ─────────────────────────────────────────────────────
 
 def split_text_by_words_to_token_limit(
@@ -714,9 +761,9 @@ def split_text_by_words_to_token_limit(
     if counter.count(text) <= max_tokens:
         return [text]
 
-    words  = text.split()
+    words = text.split()
     pieces: list[str] = []
-    cur:    list[str] = []
+    cur: list[str] = []
 
     for word in words:
         candidate = " ".join(cur + [word]).strip()
@@ -733,15 +780,15 @@ def split_text_by_words_to_token_limit(
         if counter.count(piece) <= max_tokens:
             out.append(piece)
             continue
-        raw   = piece
-        step  = max(50, len(raw) // 8)
+        raw = piece
+        step = max(50, len(raw) // 8)
         start = 0
         while start < len(raw):
-            end  = min(len(raw), start + step)
+            end = min(len(raw), start + step)
             best = raw[start:end]
             while end < len(raw) and counter.count(best) <= max_tokens:
-                end  = min(len(raw), end + step)
-                nxt  = raw[start:end]
+                end = min(len(raw), end + step)
+                nxt = raw[start:end]
                 if counter.count(nxt) > max_tokens:
                     break
                 best = nxt
@@ -763,7 +810,7 @@ def split_unit_to_fit(
     sents = split_into_sentences(text)
     if len(sents) > 1:
         units: list[str] = []
-        cur:   list[str] = []
+        cur: list[str] = []
         for sent in sents:
             candidate = "\n".join(cur + [sent]).strip()
             if cur and counter.count(candidate) > max_tokens:
@@ -791,8 +838,8 @@ def last_units_with_overlap(
 ) -> list[str]:
     if overlap_tokens <= 0 or not units:
         return []
-    acc:   list[str] = []
-    total: int       = 0
+    acc: list[str] = []
+    total: int = 0
     for unit in reversed(units):
         t = counter.count(unit)
         if acc and total + t > overlap_tokens:
@@ -863,10 +910,6 @@ def semantic_chunk_structural_unit(
         semantic_threshold: float,
         semantic_min_units: int,
 ) -> list[tuple[str, dict]]:
-    """
-    Chunk one structural unit. For paragraphs we still use semantic chunking.
-    For question/list/checklist blocks we preserve structure and split conservatively.
-    """
     header_prefix = _structural_prefix(unit)
     header_prefix = f"{header_prefix}\n\n" if header_prefix else ""
     header_tokens = counter.count(header_prefix)
@@ -879,7 +922,6 @@ def semantic_chunk_structural_unit(
             text = f"{header_prefix}{piece}".strip()
             tok_len = counter.count(text)
             if tok_len < min_chunk_tokens and not chunks:
-                # Preserve short but structurally important list/question blocks.
                 pass
             elif tok_len < min_chunk_tokens:
                 continue
@@ -974,9 +1016,7 @@ def semantic_chunk_structural_unit(
                         if counter.count(f"{header_prefix}{cand}") > chunk_size_tokens:
                             flush()
                         current_units.append(piece)
-                        if counter.count(
-                                f"{header_prefix}{' '.join(current_units)}"
-                        ) >= chunk_size_tokens:
+                        if counter.count(f"{header_prefix}{' '.join(current_units)}") >= chunk_size_tokens:
                             flush()
             continue
 
@@ -1037,20 +1077,20 @@ def structural_token_chunk_text(
         cfg: dict,
         resources: RuntimeResources,
 ) -> Iterator[Tuple[int, str, dict]]:
-    chunk_size_tokens    = int(cfg.get("chunk_size_tokens")    or CHUNK_SIZE_TOKENS_DEFAULT)
+    chunk_size_tokens = int(cfg.get("chunk_size_tokens") or CHUNK_SIZE_TOKENS_DEFAULT)
     chunk_overlap_tokens = int(cfg.get("chunk_overlap_tokens") or CHUNK_OVERLAP_TOKENS_DEFAULT)
-    min_chunk_tokens     = int(cfg.get("min_chunk_tokens")     or MIN_CHUNK_TOKENS_DEFAULT)
+    min_chunk_tokens = int(cfg.get("min_chunk_tokens") or MIN_CHUNK_TOKENS_DEFAULT)
 
     if chunk_overlap_tokens >= chunk_size_tokens:
         raise ValueError("chunk_overlap_tokens must be smaller than chunk_size_tokens")
 
-    counter        = resources.token_counter
-    sem_encoder    = resources.semantic_encoder
+    counter = resources.token_counter
+    sem_encoder = resources.semantic_encoder
     enable_section = bool(cfg.get("enable_section_awareness", ENABLE_SECTION_AWARENESS_DEFAULT))
-    sem_threshold  = float(cfg.get("semantic_threshold") or SEMANTIC_THRESHOLD_DEFAULT)
-    sem_min_units  = int(cfg.get("semantic_min_units")   or SEMANTIC_MIN_UNITS_DEFAULT)
+    sem_threshold = float(cfg.get("semantic_threshold") or SEMANTIC_THRESHOLD_DEFAULT)
+    sem_min_units = int(cfg.get("semantic_min_units") or SEMANTIC_MIN_UNITS_DEFAULT)
 
-    sections  = split_into_sections(text, enable_section_awareness=enable_section)
+    sections = split_into_sections(text, enable_section_awareness=enable_section)
     chunk_idx = 0
 
     for section_index, section in enumerate(sections):
@@ -1072,14 +1112,14 @@ def structural_token_chunk_text(
             if counter.count(chunk_text) < effective_min:
                 continue
             meta = {
-                "section_index":              section_index,
-                "section_title":              extra_meta.get("section_title", ""),
-                "subsection_title":           extra_meta.get("subsection_title", ""),
-                "section_level":              extra_meta.get("section_level", 0),
-                "content_type":               extra_meta.get("content_type", "paragraph"),
-                "hierarchy_path":             extra_meta.get("hierarchy_path", []),
-                "semantic_chunking_used":     extra_meta.get("semantic_chunking_used", False),
-                "semantic_similarity_prev":   extra_meta.get("semantic_similarity_prev"),
+                "section_index": section_index,
+                "section_title": extra_meta.get("section_title", ""),
+                "subsection_title": extra_meta.get("subsection_title", ""),
+                "section_level": extra_meta.get("section_level", 0),
+                "content_type": extra_meta.get("content_type", "paragraph"),
+                "hierarchy_path": extra_meta.get("hierarchy_path", []),
+                "semantic_chunking_used": extra_meta.get("semantic_chunking_used", False),
+                "semantic_similarity_prev": extra_meta.get("semantic_similarity_prev"),
                 "tokenizer_backend_resolved": counter.resolved_backend,
             }
             if "merged_small_tail" in extra_meta:
@@ -1105,7 +1145,7 @@ def read_docx(path: Path) -> str:
     if Document is None:
         raise RuntimeError("Missing dependency: python-docx (pip install python-docx)")
 
-    doc   = Document(str(path))
+    doc = Document(str(path))
     parts = list(_iter_block_text(doc))
 
     cleaned: list[str] = []
@@ -1154,15 +1194,37 @@ def _iter_block_items(
 
 
 def _paragraph_text(paragraph: "Paragraph") -> str:
-    return _normalize_docx_text(paragraph.text)
+    text = _normalize_docx_text(paragraph.text)
+    if not text:
+        return ""
+    try:
+        style_name = paragraph.style.name if paragraph.style else ""
+        kind, level = _classify_paragraph_style(style_name)
+        if kind == "heading" and 1 <= level <= 6:
+            return f"{'#' * level} {text}"
+        if kind == "list" and not _BULLET_RE.match(text):
+            return f"- {text}"
+    except Exception:
+        pass
+    return text
 
 
 def _table_to_text(table: "Table", *, table_depth: int = 0) -> str:
-    row_lines: list[str]       = []
+    row_lines: list[str] = []
     seen: set[tuple[str, ...]] = set()
 
     for row in table.rows:
         cell_texts = [_cell_text(cell, table_depth=table_depth + 1) for cell in row.cells]
+
+        # Deduplicate cells within a row — merged cells appear multiple times
+        seen_cells: set[str] = set()
+        deduped: list[str] = []
+        for c in cell_texts:
+            if c and c not in seen_cells:
+                seen_cells.add(c)
+                deduped.append(c)
+        cell_texts = deduped
+
         sig = tuple(cell_texts)
         if not any(t.strip() for t in cell_texts):
             continue
@@ -1175,10 +1237,9 @@ def _table_to_text(table: "Table", *, table_depth: int = 0) -> str:
 
     return "\n".join(row_lines)
 
-
 def _cell_text(cell: "_Cell", *, table_depth: int) -> str:
     parts: list[str] = []
-    seen:  set[str]  = set()
+    seen: set[str] = set()
     for item in _iter_block_text(cell, table_depth=table_depth):
         s = _normalize_docx_text(item)
         if not s or s in seen:
@@ -1254,12 +1315,6 @@ def _ocr_fitz_page(
         tessdata_dir: Optional[str],
         dpi: int = 300,
 ) -> str:
-    """
-    Render a PyMuPDF page to a temp PNG and run Tesseract OCR on it.
-
-    Uses a temporary file instead of PIL so that Pillow is not required.
-    Only called for Type-B pages (scanned, no text layer).
-    """
     if pytesseract is None or fitz is None:
         return ""
     try:
@@ -1271,7 +1326,7 @@ def _ocr_fitz_page(
         pix.save(tmp_path)
 
         try:
-            tcfg   = f"--tessdata-dir {tessdata_dir}" if tessdata_dir else ""
+            tcfg = f"--tessdata-dir {tessdata_dir}" if tessdata_dir else ""
             result = (pytesseract.image_to_string(tmp_path, lang=lang, config=tcfg) or "").strip()
         finally:
             try:
@@ -1286,23 +1341,29 @@ def _ocr_fitz_page(
 
 # ── PyMuPDF image-extraction helpers ─────────────────────────────────────────
 
+def _safe_cache_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9äöüÄÖÜß._-]+", "_", value or "")
+    value = re.sub(r"_+", "_", value).strip("._-")
+    return value or "unknown"
+
+
 def _image_cache_path(
+        *,
+        source_kind: str,
+        case_id: Optional[str],
+        source_name: str,
         source_path: str,
         page_index: int,
         img_index: int,
         ext: str,
         cache_dir: Path,
 ) -> Path:
-    """
-    Deterministic, filesystem-safe cache path for one extracted image.
-
-    Format: <cache_dir>/<safe_source>_p<page>_i<img>.<ext>
-
-    Separators and special characters in source_path are replaced with
-    underscores so the filename stays flat and portable.
-    """
-    safe = re.sub(r"[/\\:*?\"<>|]", "_", source_path)
-    return cache_dir / f"{safe}_p{page_index}_i{img_index}.{ext}"
+    doc_stem = _safe_cache_name(Path(source_name).stem)
+    owner = _safe_cache_name(case_id) if source_kind == "case_material" and case_id else "rules"
+    short_hash = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:8]
+    safe_ext = _safe_cache_name(ext.lower().lstrip(".")) or "img"
+    filename = f"{owner}__{doc_stem}__p{page_index}_i{img_index}__{short_hash}.{safe_ext}"
+    return cache_dir / filename
 
 
 def classify_pdf_page(
@@ -1312,37 +1373,11 @@ def classify_pdf_page(
         min_text_chars: int = 80,
         full_page_image_ratio: float = 0.85,
 ) -> dict:
-    """
-    Inspect one PDF page and classify what it contains.
-
-    Three page types exist in practice:
-
-      Type A — text PDF with embedded figures
-        get_text() returns substantial text; images are smaller than the page.
-        Action: extract text normally; save embedded images to cache.
-
-      Type B — scanned PDF (the page IS a raster image, no text layer)
-        get_text() returns almost nothing; one large image covers the page.
-        Action: run OCR.
-
-      Type C — searchable scan (OCR layer already present in the PDF)
-        get_text() returns text; one large image covers the page.
-        Action: use existing text layer; skip OCR.
-
-    The page type is determined by comparing each embedded image's area
-    (converted to PDF points) against the full page area.
-
-    Returns:
-        text              selectable text extracted by PyMuPDF
-        needs_ocr         True only for Type B (scan without a text layer)
-        embedded_images   list of xrefs for non-full-page figures (Type A)
-        is_full_page_scan True for Type B and Type C
-    """
-    text      = page.get_text().strip()
+    text = page.get_text().strip()
     page_area = page.rect.width * page.rect.height
 
     embedded_images: list[int] = []
-    is_full_page_scan           = False
+    is_full_page_scan = False
 
     for img in page.get_images(full=True):
         xref = img[0]
@@ -1351,92 +1386,72 @@ def classify_pdf_page(
         except Exception:
             continue
 
-        img_w = base["width"]
-        img_h = base["height"]
-        xres  = base.get("xres") or 72
-        yres  = base.get("yres") or 72
+        img_w = base.get("width", 0)
+        img_h = base.get("height", 0)
+        xres = base.get("xres") or 72
+        yres = base.get("yres") or 72
 
-        # Convert image dimensions from pixels → PDF points (1 pt = 1/72 inch).
-        # page.rect is in points; without this conversion coverage would be
-        # computed in mixed units and give nonsensical results.
+        if img_w <= 0 or img_h <= 0:
+            continue
+
         img_w_pt = img_w * 72.0 / xres
         img_h_pt = img_h * 72.0 / yres
         coverage = (img_w_pt * img_h_pt) / page_area if page_area > 0 else 0.0
 
         if coverage >= full_page_image_ratio:
-            is_full_page_scan = True      # image IS the page
+            is_full_page_scan = True
         else:
-            embedded_images.append(xref)  # image is a figure within the page
+            embedded_images.append(xref)
 
-    # OCR is only necessary for Type B.
-    # Type C already has a usable text layer returned by get_text().
     needs_ocr = is_full_page_scan and len(text) < min_text_chars
 
     return {
-        "text":              text,
-        "needs_ocr":         needs_ocr,
-        "embedded_images":   embedded_images,
+        "text": text,
+        "needs_ocr": needs_ocr,
+        "embedded_images": embedded_images,
         "is_full_page_scan": is_full_page_scan,
     }
 
 
-def extract_page_images(
-        doc: "fitz.Document",
+def render_page_image_for_vision(
+        page: "fitz.Page",
         *,
-        xrefs: list[int],
         page_index: int,
         source_path: str,
+        source_name: str,
+        source_kind: str,
+        case_id: Optional[str],
         cache_dir: Path,
-        min_px: int = 100,
-) -> list[str]:
-    """
-    Extract embedded figures from a PDF page and write them to the image cache.
-
-    Skips images smaller than min_px in either dimension — these are typically
-    decorative elements (icons, rule lines, bullets) with no semantic value.
-
-    Returns absolute file paths of all saved images.
-    Paths are stored in chunk metadata so the inference pipeline can find
-    them for lazy vision captioning without re-parsing the PDF.
-    """
+        dpi: int = 150,
+) -> Optional[str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[str] = []
+    dest = _image_cache_path(
+        source_kind=source_kind,
+        case_id=case_id,
+        source_name=source_name,
+        source_path=source_path,
+        page_index=page_index,
+        img_index=0,
+        ext="png",
+        cache_dir=cache_dir,
+    )
 
-    for img_index, xref in enumerate(xrefs):
-        try:
-            base      = doc.extract_image(xref)
-            img_bytes = base["image"]
-            ext       = base.get("ext", "png")
-            w         = base.get("width",  0)
-            h         = base.get("height", 0)
+    if dest.exists():
+        return str(dest)
 
-            if w < min_px or h < min_px:
-                continue
+    try:
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+        pix.save(dest)
+        return str(dest)
+    except Exception:
+        return None
 
-            dest = _image_cache_path(source_path, page_index, img_index, ext, cache_dir)
-            dest.write_bytes(img_bytes)
-            saved.append(str(dest))
-        except Exception:
-            continue
-
-    return saved
 
 
 # ── pdfplumber per-page text helper ──────────────────────────────────────────
 
 def _extract_pdfplumber_page_text(page) -> str:
-    """
-    Extract text and table content from a single pdfplumber page.
-
-    pdfplumber recovers table cell content by analysing character positions,
-    which significantly outperforms get_text() on complex grid layouts.
-    On the reference document this yields 24 k chars vs PyMuPDF's 11 k.
-
-    Tables are formatted as pipe-separated rows and appended after the
-    page's running text so both are present in the same chunk.
-
-    Returns an empty string if both text and tables are empty.
-    """
     try:
         page_text = (page.extract_text() or "").strip()
 
@@ -1456,68 +1471,101 @@ def _extract_pdfplumber_page_text(page) -> str:
         return ""
 
 
-# ── PDF reader (hybrid: pdfplumber text + PyMuPDF images) ────────────────────
 
-def read_pdf(path: Path, *, cfg: dict) -> Tuple[str, dict]:
-    """
-    Hybrid PDF reader.
+# ── PDF extractor quality helpers ─────────────────────────────────────────────
 
-    Text extraction per page (in priority order):
-      1. pdfplumber  — primary; best layout and table recovery (verified on
-                       real documents: ~2× more chars than PyMuPDF alone)
-      2. PyMuPDF     — automatic fallback if pdfplumber is unavailable or
-                       raises an exception on a specific file
-      3. Tesseract   — OCR fallback for scanned pages without a text layer
-                       (triggered only when the page is classified as Type B)
+_SUSPICIOUS_LONG_TOKEN_RE = re.compile(r"[A-Za-zÄÖÜäöüß]{%d,}" % PDF_SUSPICIOUS_RUN_LEN_DEFAULT)
 
-    Image extraction always uses PyMuPDF:
-      - classify_pdf_page() distinguishes embedded figures from full-page scans
-      - extract_page_images() saves figures to the image cache folder
-      - Image paths are stored in metadata["embedded_images"] for the
-        inference pipeline to use during lazy vision captioning
+def _count_suspicious_long_runs(text: str, *, min_len: int) -> int:
+    if not text:
+        return 0
+    pattern = re.compile(r"[A-Za-zÄÖÜäöüß]{%d,}" % max(8, min_len))
+    return len(pattern.findall(text))
 
-    The metadata field "pdf_text_reader" records which library produced the
-    final text so results can be audited and reproduced.
-    """
+def _score_extracted_text(text: str, *, suspicious_run_len: int) -> tuple[int, int, int]:
+    chars = len(text or "")
+    suspicious = _count_suspicious_long_runs(text or "", min_len=suspicious_run_len)
+    # Higher is better: reward coverage, penalize suspicious glued words strongly.
+    score = chars - suspicious * suspicious_run_len * 6
+    return score, chars, suspicious
+
+def _choose_best_pdf_text(
+        candidates: list[tuple[str, str]],
+        *,
+        suspicious_run_len: int,
+) -> tuple[str, str, dict]:
+    scored: list[tuple[int, int, int, str, str]] = []
+    for reader_name, text in candidates:
+        score, chars, suspicious = _score_extracted_text(text, suspicious_run_len=suspicious_run_len)
+        scored.append((score, chars, suspicious, reader_name, text))
+    scored.sort(key=lambda x: (x[0], x[1], -x[2]), reverse=True)
+    best_score, best_chars, best_suspicious, best_reader, best_text = scored[0]
+    meta = {
+        "pdf_text_reader_candidates": [
+            {
+                "reader": reader_name,
+                "chars": chars,
+                "suspicious_long_runs": suspicious,
+                "score": score,
+            }
+            for score, chars, suspicious, reader_name, _ in scored
+        ],
+        "pdf_text_reader_selected": best_reader,
+        "pdf_text_quality_suspicious_runs": best_suspicious,
+        "pdf_text_quality_chars": best_chars,
+    }
+    return best_reader, best_text, meta
+
+
+# ── PDF reader ────────────────────────────────────────────────────────────────
+
+def read_pdf(
+        path: Path,
+        *,
+        cfg: dict,
+        source_kind: str = "normbasis",
+        case_id: Optional[str] = None,
+        source_path: Optional[str] = None,
+) -> Tuple[str, dict]:
     if pdfplumber is None and fitz is None:
         raise RuntimeError(
             "At least one PDF library is required: "
             "pdfplumber (pip install pdfplumber) or PyMuPDF (pip install PyMuPDF)"
         )
 
-    enable_ocr    = bool (cfg.get("enable_ocr",               ENABLE_OCR_DEFAULT))
-    ocr_lang      = str  (cfg.get("ocr_lang")              or OCR_LANG_DEFAULT)
-    ocr_min_chars = int  (cfg.get("ocr_min_chars_per_page") or OCR_MIN_CHARS_PER_PAGE_DEFAULT)
-    ocr_dpi       = int  (cfg.get("ocr_dpi")               or OCR_DPI_DEFAULT)
-    img_ratio     = float(cfg.get("full_page_image_ratio")  or FULL_PAGE_IMAGE_RATIO_DEFAULT)
-    min_px        = int  (cfg.get("min_image_px")           or MIN_IMAGE_PX_DEFAULT)
-    cache_dir     = Path (str(cfg.get("image_cache_dir")    or IMAGE_CACHE_DIR_DEFAULT))
+    enable_ocr = bool(cfg.get("enable_ocr", ENABLE_OCR_DEFAULT))
+    resolved_source_path = source_path or str(path)
+    ocr_lang = str(cfg.get("ocr_lang") or OCR_LANG_DEFAULT)
+    ocr_min_chars = int(cfg.get("ocr_min_chars_per_page") or OCR_MIN_CHARS_PER_PAGE_DEFAULT)
+    ocr_dpi = int(cfg.get("ocr_dpi") or OCR_DPI_DEFAULT)
+    img_ratio = float(cfg.get("full_page_image_ratio") or FULL_PAGE_IMAGE_RATIO_DEFAULT)
+    min_px = int(cfg.get("min_image_px") or MIN_IMAGE_PX_DEFAULT)
+    vision_page_render_dpi = int(cfg.get("vision_page_render_dpi") or VISION_PAGE_RENDER_DPI_DEFAULT)
+    pdf_text_extractor = str(cfg.get("pdf_text_extractor") or PDF_TEXT_EXTRACTOR_DEFAULT).strip().lower()
+    suspicious_run_len = int(cfg.get("pdf_suspicious_run_len") or PDF_SUSPICIOUS_RUN_LEN_DEFAULT)
+    cache_dir = Path(str(cfg.get("image_cache_dir") or IMAGE_CACHE_DIR_DEFAULT))
 
     meta: dict = {
-        "pdf_ocr_used":    False,
-        "pdf_pages":       0,
-        "pdf_text_chars":  0,
-        "pdf_text_reader": None,  # "pdfplumber" | "pymupdf" | either + "+ocr"
-        "ocr_lang":        ocr_lang,
-        "embedded_images": [],    # paths of all figures saved to image cache
+        "pdf_ocr_used": False,
+        "pdf_pages": 0,
+        "pdf_text_chars": 0,
+        "pdf_text_reader": None,
+        "ocr_lang": ocr_lang,
+        "embedded_images": [],
     }
 
-    # Tesseract is resolved lazily — only when a page actually needs OCR
-    _tess_cmd:  Optional[str] = None
+    _tess_cmd: Optional[str] = None
     _tess_data: Optional[str] = None
 
     def _ensure_tesseract() -> Optional[str]:
         nonlocal _tess_cmd, _tess_data
         if _tess_cmd is None:
-            _tess_cmd  = _resolve_tesseract_cmd(cfg.get("tesseract_cmd"))
+            _tess_cmd = _resolve_tesseract_cmd(cfg.get("tesseract_cmd"))
             _tess_data = _resolve_tessdata_dir(_tess_cmd, cfg.get("tessdata_dir"))
             if pytesseract is not None:
                 pytesseract.pytesseract.tesseract_cmd = _tess_cmd
         return _tess_data
 
-    # Open PyMuPDF once for the whole file.
-    # Used for image extraction and OCR rendering regardless of which
-    # library handles text extraction.
     fitz_doc = None
     if fitz is not None:
         try:
@@ -1528,127 +1576,135 @@ def read_pdf(path: Path, *, cfg: dict) -> Tuple[str, dict]:
                 level="WARN", cfg=cfg, err=True,
             )
 
-    parts: list[str]           = []
-    all_image_paths: list[str] = []
-    use_pdfplumber             = pdfplumber is not None
-
-    # ── Branch A: pdfplumber (primary text path) ──────────────────────────────
-    if use_pdfplumber:
+    plumber_doc = None
+    if pdfplumber is not None:
         try:
-            with pdfplumber.open(path) as plumber_doc:
-                meta["pdf_pages"]       = len(plumber_doc.pages)
-                meta["pdf_text_reader"] = "pdfplumber"
-
-                for page_idx, plumber_page in enumerate(plumber_doc.pages):
-                    page_text = _extract_pdfplumber_page_text(plumber_page)
-
-                    if fitz_doc is not None:
-                        fitz_page = fitz_doc.load_page(page_idx)
-                        info      = classify_pdf_page(
-                            fitz_doc, fitz_page,
-                            min_text_chars=ocr_min_chars,
-                            full_page_image_ratio=img_ratio,
-                        )
-
-                        # Save embedded figures to the image cache
-                        if info["embedded_images"]:
-                            saved = extract_page_images(
-                                fitz_doc,
-                                xrefs=info["embedded_images"],
-                                page_index=page_idx,
-                                source_path=str(path),
-                                cache_dir=cache_dir,
-                                min_px=min_px,
-                            )
-                            all_image_paths.extend(saved)
-
-                        # OCR: only when pdfplumber text is sparse AND PyMuPDF
-                        # confirms the page is a scan (not just low-content text)
-                        if (
-                                len(page_text) < ocr_min_chars
-                                and info["is_full_page_scan"]
-                                and enable_ocr
-                        ):
-                            tessdata  = _ensure_tesseract()
-                            ocr_text  = _ocr_fitz_page(
-                                fitz_page, lang=ocr_lang,
-                                tessdata_dir=tessdata, dpi=ocr_dpi,
-                            )
-                            if ocr_text:
-                                page_text = ocr_text
-                                meta["pdf_ocr_used"]    = True
-                                meta["pdf_text_reader"] = "pdfplumber+ocr"
-
-                    if page_text:
-                        parts.append(page_text)
-
+            plumber_doc = pdfplumber.open(path)
         except Exception as e:
-            # pdfplumber crashed on this specific file → fall through to Branch B
             log(
-                f"pdfplumber failed on {path.name}: {e} — falling back to PyMuPDF",
+                f"pdfplumber failed to open {path.name}: {e}",
                 level="WARN", cfg=cfg, err=True,
             )
-            parts          = []
-            use_pdfplumber = False  # signal Branch B to run
 
-    # ── Branch B: PyMuPDF only (fallback when pdfplumber unavailable/crashed) ─
-    if not use_pdfplumber or not parts:
+    try:
+        page_count = 0
         if fitz_doc is not None:
-            meta["pdf_pages"]       = len(fitz_doc)
-            meta["pdf_text_reader"] = "pymupdf"
+            page_count = len(fitz_doc)
+        elif plumber_doc is not None:
+            page_count = len(plumber_doc.pages)
+        meta["pdf_pages"] = page_count
 
-            for fitz_page in fitz_doc:
-                info      = classify_pdf_page(
+        parts: list[str] = []
+        all_image_paths: list[str] = []
+
+        if pdf_text_extractor == "pdfplumber_first":
+            reader_priority = ("pdfplumber", "pymupdf")
+        else:
+            reader_priority = ("pymupdf", "pdfplumber")
+
+        for page_idx in range(page_count):
+            fitz_page = fitz_doc.load_page(page_idx) if fitz_doc is not None else None
+            plumber_page = plumber_doc.pages[page_idx] if plumber_doc is not None else None
+
+            fitz_info = None
+            if fitz_page is not None and fitz_doc is not None:
+                fitz_info = classify_pdf_page(
                     fitz_doc, fitz_page,
                     min_text_chars=ocr_min_chars,
                     full_page_image_ratio=img_ratio,
                 )
-                page_text = info["text"]
 
-                if info["embedded_images"]:
-                    saved = extract_page_images(
-                        fitz_doc,
-                        xrefs=info["embedded_images"],
-                        page_index=fitz_page.number,
-                        source_path=str(path),
+                has_relevant_page_image = bool(fitz_info["embedded_images"]) or fitz_info["is_full_page_scan"]
+                if has_relevant_page_image:
+                    rendered = render_page_image_for_vision(
+                        fitz_page,
+                        page_index=page_idx,
+                        source_path=resolved_source_path,
+                        source_name=path.name,
+                        source_kind=source_kind,
+                        case_id=case_id,
                         cache_dir=cache_dir,
-                        min_px=min_px,
+                        dpi=vision_page_render_dpi,
                     )
-                    all_image_paths.extend(saved)
+                    if rendered:
+                        all_image_paths.append(rendered)
 
-                if info["needs_ocr"] and enable_ocr:
-                    tessdata  = _ensure_tesseract()
-                    ocr_text  = _ocr_fitz_page(
+            candidates: list[tuple[str, str]] = []
+            for reader_name in reader_priority:
+                if reader_name == "pymupdf" and fitz_page is not None and fitz_info is not None:
+                    candidates.append(("pymupdf", fitz_info["text"]))
+                elif reader_name == "pdfplumber" and plumber_page is not None:
+                    candidates.append(("pdfplumber", _extract_pdfplumber_page_text(plumber_page)))
+
+            page_text = ""
+            page_reader = None
+            if candidates:
+                page_reader, page_text, quality_meta = _choose_best_pdf_text(
+                    candidates,
+                    suspicious_run_len=suspicious_run_len,
+                )
+                meta.setdefault("pdf_page_text_quality", []).append({
+                    "page_index": page_idx,
+                    **quality_meta,
+                })
+
+            if fitz_info is not None:
+                needs_ocr = fitz_info["is_full_page_scan"] and len(page_text) < ocr_min_chars
+                if needs_ocr and enable_ocr:
+                    tessdata = _ensure_tesseract()
+                    ocr_text = _ocr_fitz_page(
                         fitz_page, lang=ocr_lang,
                         tessdata_dir=tessdata, dpi=ocr_dpi,
                     )
                     if ocr_text:
                         page_text = ocr_text
-                        meta["pdf_ocr_used"]    = True
-                        meta["pdf_text_reader"] = "pymupdf+ocr"
+                        page_reader = f"{page_reader or 'pymupdf'}+ocr"
+                        meta["pdf_ocr_used"] = True
 
-                if page_text:
-                    parts.append(page_text)
+            if page_text:
+                parts.append(page_text)
 
-    if fitz_doc is not None:
-        fitz_doc.close()
+            if meta["pdf_text_reader"] is None and page_reader:
+                meta["pdf_text_reader"] = page_reader
 
-    full_text               = "\n\n".join(parts).strip()
-    meta["pdf_text_chars"]  = len(full_text)
-    meta["embedded_images"] = all_image_paths
-    return full_text, meta
+        full_text = "\n\n".join(parts).strip()
+        meta["pdf_text_chars"] = len(full_text)
+        meta["embedded_images"] = list(dict.fromkeys(all_image_paths))
+
+        page_quality = meta.get("pdf_page_text_quality", [])
+        if page_quality:
+            selected = [p["pdf_text_reader_selected"] for p in page_quality if p.get("pdf_text_reader_selected")]
+            if selected:
+                counts = {}
+                for s in selected:
+                    counts[s] = counts.get(s, 0) + 1
+                majority_reader = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+                suffix = "+ocr" if meta["pdf_ocr_used"] else ""
+                meta["pdf_text_reader"] = f"{majority_reader}{suffix}"
+
+        return full_text, meta
+
+    finally:
+        if plumber_doc is not None:
+            try:
+                plumber_doc.close()
+            except Exception:
+                pass
+        if fitz_doc is not None:
+            fitz_doc.close()
+
 
 
 # ── Dispatch: read any supported format ──────────────────────────────────────
 
-def read_any(path: Path, *, rel_path: str, cfg: dict) -> Tuple[str, dict]:
-    """
-    Return (text, read_meta) for any supported file type.
-
-    PPTX is converted to PDF via LibreOffice first, then processed with
-    read_pdf(). The PPTX-specific OCR flag overrides the general OCR flag
-    only for that conversion step.
-    """
+def read_any(
+        path: Path,
+        *,
+        rel_path: str,
+        cfg: dict,
+        source_kind: str = "normbasis",
+        case_id: Optional[str] = None,
+) -> Tuple[str, dict]:
     ext = path.suffix.lower()
 
     if ext in {".txt", ".md"}:
@@ -1658,17 +1714,29 @@ def read_any(path: Path, *, rel_path: str, cfg: dict) -> Tuple[str, dict]:
         return read_docx(path), {}
 
     if ext == ".pdf":
-        return read_pdf(path, cfg=cfg)
+        return read_pdf(
+            path,
+            cfg=cfg,
+            source_kind=source_kind,
+            case_id=case_id,
+            source_path=rel_path,
+        )
 
     if ext == ".pptx":
         pdf_path = pptx_to_pdf(path, cfg.get("soffice_cmd"), cfg_for_log=cfg)
         pptx_cfg = {**cfg, "enable_ocr": bool(cfg.get("enable_ocr_pptx", False))}
-        pdf_text, pdf_meta = read_pdf(pdf_path, cfg=pptx_cfg)
+        pdf_text, pdf_meta = read_pdf(
+            pdf_path,
+            cfg=pptx_cfg,
+            source_kind=source_kind,
+            case_id=case_id,
+            source_path=rel_path,
+        )
         pdf_meta.update({
             "origin_source_path": rel_path.replace("\\", "/"),
             "origin_source_name": path.name,
-            "origin_ext":         ".pptx",
-            "converted_pdf":      pdf_path.name,
+            "origin_ext": ".pptx",
+            "converted_pdf": pdf_path.name,
         })
         return pdf_text, pdf_meta
 
@@ -1703,7 +1771,7 @@ def resolve_soffice_cmd(explicit: Optional[str]) -> str:
 
 
 def pptx_to_pdf(path: Path, soffice_cmd: Optional[str], *, cfg_for_log: dict) -> Path:
-    cmd     = resolve_soffice_cmd(soffice_cmd)
+    cmd = resolve_soffice_cmd(soffice_cmd)
     out_dir = path.parent / ".converted"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pdf = out_dir / f"{path.stem}.pdf"
@@ -1725,7 +1793,7 @@ def pptx_to_pdf(path: Path, soffice_cmd: Optional[str], *, cfg_for_log: dict) ->
     return out_pdf
 
 
-# ── Vision utility – INFERENCE TIME only, never called during ingestion ───────
+# ── Vision utility ────────────────────────────────────────────────────────────
 
 def ollama_caption_png(
         *,
@@ -1733,27 +1801,13 @@ def ollama_caption_png(
         png_bytes: bytes,
         prompt: Optional[str] = None,
 ) -> str:
-    """
-    Send a PNG image to qwen2.5vl:7b via the Ollama /api/chat endpoint
-    and return the model's description.
-
-    This is an INFERENCE-TIME utility. Import and call it from your query /
-    error-detection pipeline after retrieving a chunk whose metadata contains
-    paths in "embedded_images".
-
-    Args:
-        cfg:       config dict — must contain "vision_model" and
-                   "ollama_base_url"; optionally "vision_timeout_s"
-        png_bytes: raw PNG bytes of the image to describe
-        prompt:    override prompt; falls back to VISION_PROMPT_FIGURE_DEFAULT
-    """
     try:
         import requests  # pip install requests
     except Exception as e:
         raise RuntimeError("Missing dependency: requests (pip install requests)") from e
 
     base_url = str(cfg.get("ollama_base_url") or OLLAMA_BASE_URL_DEFAULT).rstrip("/")
-    model    = str(cfg.get("vision_model")    or "").strip()
+    model = str(cfg.get("vision_model") or "").strip()
     if not model:
         raise RuntimeError("VISION_MODEL is required for vision captioning (e.g. qwen2.5vl:7b)")
 
@@ -1761,22 +1815,24 @@ def ollama_caption_png(
             prompt or str(cfg.get("vision_prompt") or VISION_PROMPT_FIGURE_DEFAULT)
     ).strip()
     timeout_s = int(cfg.get("vision_timeout_s") or VISION_TIMEOUT_S_DEFAULT)
-    b64       = base64.b64encode(png_bytes).decode("ascii")
+    vision_options = dict(cfg.get("vision_options") or {})
+    b64 = base64.b64encode(png_bytes).decode("ascii")
 
     payload = {
-        "model":  model,
+        "model": model,
         "stream": False,
         "messages": [
             {
-                "role":    "system",
+                "role": "system",
                 "content": "Du bist ein präziser Assistent für technische Dokumentenanalyse.",
             },
             {
-                "role":    "user",
+                "role": "user",
                 "content": effective_prompt,
-                "images":  [b64],
+                "images": [b64],
             },
         ],
+        "options": vision_options,
     }
 
     r = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout_s)
@@ -1790,48 +1846,48 @@ def ollama_caption_png(
 def iter_records_for_path(
         path: Path,
         *,
-        data_dir: Path,
+        source_ctx: SourceContext,
         cfg: dict,
         st: RunStats,
         resources: RuntimeResources,
 ) -> Iterator[ChunkRecord]:
-    """
-    Yield ChunkRecord objects for a single file.
-
-    All file types go through the same pipeline:
-        read_any() → normalize_text() → structural_token_chunk_text()
-
-    Image paths discovered by read_pdf() are carried in base_meta and
-    inherited by every chunk from that file. The inference pipeline uses
-    chunk.metadata["embedded_images"] to locate figures for lazy captioning.
-    """
-    rel_path = str(path.relative_to(data_dir)).replace("\\", "/")
-
-    raw, read_meta = read_any(path, rel_path=rel_path, cfg=cfg)
+    raw, read_meta = read_any(
+        path,
+        rel_path=source_ctx.rel_path,
+        cfg=cfg,
+        source_kind=source_ctx.source_kind,
+        case_id=source_ctx.case_id,
+    )
     text = normalize_text(raw)
     if not text:
-        log(f"skip (no text) file={rel_path}", level="DEBUG", cfg=cfg)
+        log(f"skip (no text) file={source_ctx.rel_path}", level="DEBUG", cfg=cfg)
         return
 
-    fhash     = file_sha256(path)
-    base_meta = build_metadata(path, rel_path, text)
-    base_meta.update({"file_sha256": fhash, **read_meta})
+    fhash = file_sha256(path)
+    base_meta = build_metadata(path, source_ctx.rel_path, text)
+    base_meta.update({
+        "file_sha256": fhash,
+        "source_kind": source_ctx.source_kind,
+        "case_id": source_ctx.case_id,
+        "document_type": source_ctx.document_type,
+        **read_meta,
+    })
 
-    chunk_size_tokens    = int(cfg.get("chunk_size_tokens")    or CHUNK_SIZE_TOKENS_DEFAULT)
+    chunk_size_tokens = int(cfg.get("chunk_size_tokens") or CHUNK_SIZE_TOKENS_DEFAULT)
     chunk_overlap_tokens = int(cfg.get("chunk_overlap_tokens") or CHUNK_OVERLAP_TOKENS_DEFAULT)
-    min_chunk_tokens     = int(cfg.get("min_chunk_tokens")     or MIN_CHUNK_TOKENS_DEFAULT)
+    min_chunk_tokens = int(cfg.get("min_chunk_tokens") or MIN_CHUNK_TOKENS_DEFAULT)
 
     for chunk_index, ctext, extra_meta in structural_token_chunk_text(
             text, cfg=cfg, resources=resources
     ):
-        heartbeat(st, cfg=cfg, extra=f"current={rel_path} chunk={chunk_index}")
+        heartbeat(st, cfg=cfg, extra=f"current={source_ctx.rel_path} chunk={chunk_index}")
         meta = {
             **base_meta,
-            "chunk_index":           chunk_index,
-            "chunk_len":             len(ctext),
-            "chunk_size_tokens":     chunk_size_tokens,
-            "chunk_overlap_tokens":  chunk_overlap_tokens,
-            "min_chunk_tokens":      min_chunk_tokens,
+            "chunk_index": chunk_index,
+            "chunk_len": len(ctext),
+            "chunk_size_tokens": chunk_size_tokens,
+            "chunk_overlap_tokens": chunk_overlap_tokens,
+            "min_chunk_tokens": min_chunk_tokens,
             **extra_meta,
         }
         yield ChunkRecord(
@@ -1841,18 +1897,47 @@ def iter_records_for_path(
         )
 
 
-# ── Ingestion loop ────────────────────────────────────────────────────────────
+# ── Source file enumeration ───────────────────────────────────────────────────
 
-def iter_files(data_dir: Path) -> Iterator[Path]:
-    for p in data_dir.rglob("*"):
-        # Skip the LibreOffice conversion cache entirely
+def iter_files_in_root(root: Path) -> Iterator[Path]:
+    for p in root.rglob("*"):
         if ".converted" in p.parts:
             continue
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
             yield p
 
+
+def iter_source_files(data_dir: Optional[Path], cases_dir: Optional[Path]) -> Iterator[tuple[Path, SourceContext]]:
+    if data_dir is not None and data_dir.exists() and data_dir.is_dir():
+        for path in iter_files_in_root(data_dir):
+            rel_path = str(path.relative_to(data_dir)).replace("\\", "/")
+            yield path, SourceContext(
+                source_root=data_dir,
+                source_kind="normbasis",
+                rel_path=rel_path,
+                case_id=None,
+                document_type=None,
+            )
+
+    if cases_dir is not None and cases_dir.exists() and cases_dir.is_dir():
+        for path in iter_files_in_root(cases_dir):
+            rel_path = str(path.relative_to(cases_dir)).replace("\\", "/")
+            case_id = infer_case_id_from_rel_path(rel_path)
+            document_type = infer_document_type(path, rel_path, case_id, "case_material")
+            yield path, SourceContext(
+                source_root=cases_dir,
+                source_kind="case_material",
+                rel_path=rel_path,
+                case_id=case_id,
+                document_type=document_type,
+            )
+
+
+# ── Ingestion loop ────────────────────────────────────────────────────────────
+
 def ingest(
-        data_dir: Path,
+        data_dir: Optional[Path],
+        cases_dir: Optional[Path],
         out_path: Path,
         *,
         cfg: dict,
@@ -1863,16 +1948,21 @@ def ingest(
     files_processed = records_written = 0
 
     with out_path.open("w", encoding="utf-8") as out:
-        for path in iter_files(data_dir):
+        for path, source_ctx in iter_source_files(data_dir, cases_dir):
             files_processed += 1
             st.files = files_processed
-            rel = str(path.relative_to(data_dir)).replace("\\", "/")
-            log(f"ingest start file={rel}", cfg=cfg)
+            rel = source_ctx.rel_path
+            log(
+                f"ingest start source_kind={source_ctx.source_kind} "
+                f"case_id={source_ctx.case_id} document_type={source_ctx.document_type} "
+                f"file={rel}",
+                cfg=cfg,
+            )
 
             try:
                 wrote = 0
                 for rec in iter_records_for_path(
-                        path, data_dir=data_dir, cfg=cfg, st=st, resources=resources
+                        path, source_ctx=source_ctx, cfg=cfg, st=st, resources=resources
                 ):
                     out.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
                     records_written += 1
@@ -1892,56 +1982,60 @@ def ingest(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
-            "Ingest ./data/** → section-aware, semantic-chunked JSONL.\n"
-            "Text:   pdfplumber (primary) + PyMuPDF fallback.\n"
-            "Images: PyMuPDF extraction to image cache (lazy captioning at inference time)."
+            "Ingest documents from ./data and optional case materials from ./cases/** "
+            "into section-aware, semantic-chunked JSONL with case_id/document_type metadata."
         )
     )
 
-    ap.add_argument("--data_dir",        type=str, default=DATA_DIR_DEFAULT)
-    ap.add_argument("--out",             type=str, default=OUT_JSONL_DEFAULT)
+    ap.add_argument("--data_dir", type=str, default=DATA_DIR_DEFAULT)
+    ap.add_argument("--cases_dir", type=str, default=CASES_DIR_DEFAULT)
+    ap.add_argument("--out", type=str, default=OUT_JSONL_DEFAULT)
     ap.add_argument("--image_cache_dir", type=str, default=IMAGE_CACHE_DIR_DEFAULT,
                     help="Folder where extracted PDF images are saved for inference-time captioning")
 
-    ap.add_argument("--chunk_size_tokens",    type=int, default=CHUNK_SIZE_TOKENS_DEFAULT)
+    ap.add_argument("--chunk_size_tokens", type=int, default=CHUNK_SIZE_TOKENS_DEFAULT)
     ap.add_argument("--chunk_overlap_tokens", type=int, default=CHUNK_OVERLAP_TOKENS_DEFAULT)
-    ap.add_argument("--min_chunk_tokens",     type=int, default=MIN_CHUNK_TOKENS_DEFAULT)
+    ap.add_argument("--min_chunk_tokens", type=int, default=MIN_CHUNK_TOKENS_DEFAULT)
 
     ap.add_argument("--tokenizer_backend", type=str, default=TOKENIZER_BACKEND_DEFAULT,
                     help="auto|tiktoken|transformers|simple")
-    ap.add_argument("--tokenizer_model",   type=str, default=TOKENIZER_MODEL_DEFAULT)
+    ap.add_argument("--tokenizer_model", type=str, default=TOKENIZER_MODEL_DEFAULT)
 
     ap.add_argument("--enable_section_awareness", action="store_true",
                     default=ENABLE_SECTION_AWARENESS_DEFAULT)
     ap.add_argument("--enable_semantic_chunking", action="store_true",
                     default=ENABLE_SEMANTIC_CHUNKING_DEFAULT)
-    ap.add_argument("--semantic_model",     type=str,   default=SEMANTIC_MODEL_DEFAULT)
+    ap.add_argument("--semantic_model", type=str, default=SEMANTIC_MODEL_DEFAULT)
     ap.add_argument("--semantic_threshold", type=float, default=SEMANTIC_THRESHOLD_DEFAULT)
-    ap.add_argument("--semantic_min_units", type=int,   default=SEMANTIC_MIN_UNITS_DEFAULT)
+    ap.add_argument("--semantic_min_units", type=int, default=SEMANTIC_MIN_UNITS_DEFAULT)
 
-    ap.add_argument("--enable_ocr",      action="store_true", default=ENABLE_OCR_DEFAULT,
+    ap.add_argument("--enable_ocr", action="store_true", default=ENABLE_OCR_DEFAULT,
                     help="Run Tesseract OCR on scanned PDF pages without a text layer")
     ap.add_argument("--enable_ocr_pptx", action="store_true", default=ENABLE_OCR_PPTX_DEFAULT,
                     help="Run Tesseract on scanned slides in converted PPTX files")
-    ap.add_argument("--ocr_lang",               type=str, default=OCR_LANG_DEFAULT)
+    ap.add_argument("--ocr_lang", type=str, default=OCR_LANG_DEFAULT)
     ap.add_argument("--ocr_min_chars_per_page", type=int, default=OCR_MIN_CHARS_PER_PAGE_DEFAULT)
-    ap.add_argument("--ocr_dpi",                type=int, default=OCR_DPI_DEFAULT)
+    ap.add_argument("--ocr_dpi", type=int, default=OCR_DPI_DEFAULT)
 
     ap.add_argument("--full_page_image_ratio", type=float, default=FULL_PAGE_IMAGE_RATIO_DEFAULT,
                     help="Image area / page area threshold to classify a page as a scanned image")
     ap.add_argument("--min_image_px", type=int, default=MIN_IMAGE_PX_DEFAULT,
                     help="Minimum width or height in pixels to save an extracted image")
+    ap.add_argument("--vision_page_render_dpi", type=int, default=VISION_PAGE_RENDER_DPI_DEFAULT,
+                    help="DPI for rendered full-page cache images used by vision captioning")
+    ap.add_argument("--pdf_text_extractor", type=str, default=PDF_TEXT_EXTRACTOR_DEFAULT,
+                    help="PDF text extractor preference: pymupdf_first|pdfplumber_first")
+    ap.add_argument("--pdf_suspicious_run_len", type=int, default=PDF_SUSPICIOUS_RUN_LEN_DEFAULT,
+                    help="Length threshold for suspicious glued word runs in PDF text quality scoring")
 
     ap.add_argument("--tesseract_cmd", type=str, default=TESSERACT_CMD_DEFAULT)
-    ap.add_argument("--tessdata_dir",  type=str, default=TESSDATA_DIR_DEFAULT)
-    ap.add_argument("--soffice_cmd",   type=str, default=SOFFICE_CMD_DEFAULT)
+    ap.add_argument("--tessdata_dir", type=str, default=TESSDATA_DIR_DEFAULT)
+    ap.add_argument("--soffice_cmd", type=str, default=SOFFICE_CMD_DEFAULT)
 
-    # Vision args stored in cfg for ollama_caption_png() at inference time.
-    # They have no effect during ingestion.
-    ap.add_argument("--vision_model",     type=str, default=VISION_MODEL_DEFAULT)
+    ap.add_argument("--vision_model", type=str, default=VISION_MODEL_DEFAULT)
     ap.add_argument("--vision_timeout_s", type=int, default=VISION_TIMEOUT_S_DEFAULT)
 
-    ap.add_argument("--log_level",   type=str, default=LOG_LEVEL_DEFAULT,
+    ap.add_argument("--log_level", type=str, default=LOG_LEVEL_DEFAULT,
                     help="DEBUG|INFO|WARN|ERROR")
     ap.add_argument("--log_every_s", type=int, default=LOG_EVERY_S_DEFAULT,
                     help="Heartbeat interval in seconds")
@@ -1950,40 +2044,50 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args     = parse_args()
-    data_dir = Path(args.data_dir).resolve()
+    args = parse_args()
+
+    data_dir = Path(args.data_dir).resolve() if args.data_dir else None
+    cases_dir = Path(args.cases_dir).resolve() if args.cases_dir else None
     out_path = Path(args.out).resolve()
 
-    if not data_dir.exists() or not data_dir.is_dir():
-        raise SystemExit(f"data_dir not found or not a directory: {data_dir}")
+    if data_dir is not None and not data_dir.exists():
+        data_dir = None
+    if cases_dir is not None and not cases_dir.exists():
+        cases_dir = None
+
+    if data_dir is None and cases_dir is None:
+        raise SystemExit("Neither data_dir nor cases_dir exists.")
 
     cfg = {
-        "image_cache_dir":          args.image_cache_dir,
-        "chunk_size_tokens":        args.chunk_size_tokens,
-        "chunk_overlap_tokens":     args.chunk_overlap_tokens,
-        "min_chunk_tokens":         args.min_chunk_tokens,
-        "tokenizer_backend":        args.tokenizer_backend,
-        "tokenizer_model":          args.tokenizer_model,
+        "image_cache_dir": args.image_cache_dir,
+        "chunk_size_tokens": args.chunk_size_tokens,
+        "chunk_overlap_tokens": args.chunk_overlap_tokens,
+        "min_chunk_tokens": args.min_chunk_tokens,
+        "tokenizer_backend": args.tokenizer_backend,
+        "tokenizer_model": args.tokenizer_model,
         "enable_section_awareness": args.enable_section_awareness,
         "enable_semantic_chunking": args.enable_semantic_chunking,
-        "semantic_model":           args.semantic_model,
-        "semantic_threshold":       args.semantic_threshold,
-        "semantic_min_units":       args.semantic_min_units,
-        "enable_ocr":               args.enable_ocr,
-        "enable_ocr_pptx":          args.enable_ocr_pptx,
-        "ocr_lang":                 args.ocr_lang,
-        "ocr_min_chars_per_page":   args.ocr_min_chars_per_page,
-        "ocr_dpi":                  args.ocr_dpi,
-        "full_page_image_ratio":    args.full_page_image_ratio,
-        "min_image_px":             args.min_image_px,
-        "tesseract_cmd":            args.tesseract_cmd,
-        "tessdata_dir":             args.tessdata_dir,
-        "soffice_cmd":              args.soffice_cmd,
-        "ollama_base_url":          OLLAMA_BASE_URL_DEFAULT,
-        "vision_model":             args.vision_model,
-        "vision_timeout_s":         args.vision_timeout_s,
-        "log_level":                args.log_level.upper(),
-        "log_every_s":              args.log_every_s,
+        "semantic_model": args.semantic_model,
+        "semantic_threshold": args.semantic_threshold,
+        "semantic_min_units": args.semantic_min_units,
+        "enable_ocr": args.enable_ocr,
+        "enable_ocr_pptx": args.enable_ocr_pptx,
+        "ocr_lang": args.ocr_lang,
+        "ocr_min_chars_per_page": args.ocr_min_chars_per_page,
+        "ocr_dpi": args.ocr_dpi,
+        "full_page_image_ratio": args.full_page_image_ratio,
+        "min_image_px": args.min_image_px,
+        "vision_page_render_dpi": args.vision_page_render_dpi,
+        "pdf_text_extractor": args.pdf_text_extractor,
+        "pdf_suspicious_run_len": args.pdf_suspicious_run_len,
+        "tesseract_cmd": args.tesseract_cmd,
+        "tessdata_dir": args.tessdata_dir,
+        "soffice_cmd": args.soffice_cmd,
+        "ollama_base_url": OLLAMA_BASE_URL_DEFAULT,
+        "vision_model": args.vision_model,
+        "vision_timeout_s": args.vision_timeout_s,
+        "log_level": args.log_level.upper(),
+        "log_every_s": args.log_every_s,
     }
 
     resources = RuntimeResources(
@@ -1992,23 +2096,27 @@ def main() -> None:
     )
 
     log(
-        f"config  data_dir={data_dir}  out={out_path}\n"
-        f"        chunk={cfg['chunk_size_tokens']}tok  "
-        f"overlap={cfg['chunk_overlap_tokens']}tok  "
+        f"config data_dir={data_dir} cases_dir={cases_dir} out={out_path}\n"
+        f"       chunk={cfg['chunk_size_tokens']}tok "
+        f"overlap={cfg['chunk_overlap_tokens']}tok "
         f"min={cfg['min_chunk_tokens']}tok\n"
-        f"        section_awareness={cfg['enable_section_awareness']}  "
-        f"semantic_chunking={cfg['enable_semantic_chunking']}  "
+        f"       section_awareness={cfg['enable_section_awareness']} "
+        f"semantic_chunking={cfg['enable_semantic_chunking']} "
         f"semantic_model_loaded={resources.semantic_encoder.available}\n"
-        f"        tokenizer={resources.token_counter.resolved_backend}  "
-        f"ocr={cfg['enable_ocr']}  "
+        f"       tokenizer={resources.token_counter.resolved_backend} "
+        f"ocr={cfg['enable_ocr']} "
         f"image_cache={cfg['image_cache_dir']}",
         cfg=cfg,
     )
 
     files, records = ingest(
-        data_dir=data_dir, out_path=out_path, cfg=cfg, resources=resources
+        data_dir=data_dir,
+        cases_dir=cases_dir,
+        out_path=out_path,
+        cfg=cfg,
+        resources=resources,
     )
-    log(f"done  files={files}  records={records}  output={out_path}", cfg=cfg)
+    log(f"done files={files} records={records} output={out_path}", cfg=cfg)
 
 
 if __name__ == "__main__":
