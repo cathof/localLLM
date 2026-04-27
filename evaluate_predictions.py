@@ -13,19 +13,93 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 # ── IO helpers ────────────────────────────────────────────────────────────────
 
+def _fix_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] — common authoring mistake."""
+    import re
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _parse_duplicates_object(raw: str) -> Iterator[Dict[str, Any]]:
+    """
+    Parse a single JSON object that has duplicate top-level keys
+    (e.g. segment_id appears N times, one per segment).
+    Uses object_pairs_hook to collect all pairs including duplicates,
+    flushing a new segment record each time case_id repeats.
+    """
+    segments: list = []
+    current: dict = {}
+
+    def collector(pairs: list) -> dict:
+        d: dict = {}
+        for k, v in pairs:
+            if k == "case_id" and "case_id" in d:
+                if d.get("segment_id"):
+                    segments.append(dict(d))
+                d = {}
+            d[k] = v
+        if d.get("segment_id"):
+            segments.append(dict(d))
+        return d
+
+    json.loads(raw, object_pairs_hook=collector)
+    yield from segments
+
+
 def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON on line {line_no} in {path}: {e}") from e
+    """
+    Auto-detecting loader — accepts three formats:
+      1. Proper JSONL: one JSON object per line (standard format)
+      2. JSON array:  a single file containing [...] of objects
+      3. Flat JSON object with duplicate keys (legacy authoring format)
+    """
+    raw = path.read_text(encoding="utf-8")
+    stripped = raw.lstrip()
+
+    # Format 2: JSON array
+    if stripped.startswith("["):
+        try:
+            records = json.loads(_fix_trailing_commas(raw))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse JSON array in {path}: {e}") from e
+        if not isinstance(records, list):
+            raise RuntimeError(f"{path}: expected a JSON array at top level")
+        for i, obj in enumerate(records):
             if not isinstance(obj, dict):
-                raise RuntimeError(f"Expected JSON object on line {line_no} in {path}")
+                raise RuntimeError(f"{path}: item {i} is not a JSON object")
             yield obj
+        return
+
+    # Format 3: single object with duplicate keys
+    if stripped.startswith("{"):
+        # First try as proper JSONL (one object per line)
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if len(lines) > 1 and all(l.startswith("{") and l.endswith("}") for l in lines):
+            # Proper JSONL
+            for line_no, line in enumerate(lines, start=1):
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"Invalid JSON on line {line_no} in {path}: {e}") from e
+                if not isinstance(obj, dict):
+                    raise RuntimeError(f"Expected JSON object on line {line_no} in {path}")
+                yield obj
+            return
+
+        # Single pretty-printed object — may have duplicate keys or trailing commas
+        fixed = _fix_trailing_commas(raw)
+        try:
+            # Try normal parse first (works if no duplicate keys)
+            obj = json.loads(fixed)
+            if isinstance(obj, dict) and ("segment_id" in obj or "case_id" in obj):
+                yield from _parse_duplicates_object(fixed)
+                return
+        except json.JSONDecodeError:
+            pass
+        # Fallback: parse with duplicate-key collector
+        yield from _parse_duplicates_object(fixed)
+        return
+
+    raise RuntimeError(f"{path}: unrecognised file format (does not start with {{ or [)")
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -146,6 +220,11 @@ class Finding:
     def normalized_correction(self) -> str:
         return simplify_text(self.correction)
 
+    @property
+    def main_class_id(self) -> str:
+        """Derive main class prefix from subclass_id: RECHT_TRENNUNG → RECHT"""
+        return self.subclass_id.split("_")[0] if self.subclass_id else ""
+
 
 @dataclass(frozen=True)
 class SegmentRecord:
@@ -180,10 +259,10 @@ def _validate_finding_ids(f: Finding, taxonomy: Optional[TaxonomyLookup], path: 
 
 
 def load_segment_records(
-    path: Path,
-    *,
-    findings_field: str,
-    taxonomy: Optional[TaxonomyLookup] = None,
+        path: Path,
+        *,
+        findings_field: str,
+        taxonomy: Optional[TaxonomyLookup] = None,
 ) -> Dict[Tuple[str, str], SegmentRecord]:
     records: Dict[Tuple[str, str], SegmentRecord] = {}
     for obj in iter_jsonl(path):
@@ -263,11 +342,11 @@ class MatchedPair:
 
 
 def build_candidates(
-    gold_findings: Sequence[Finding],
-    pred_findings: Sequence[Finding],
-    *,
-    min_span_score: float,
-    require_exact_subclass: bool = True,
+        gold_findings: Sequence[Finding],
+        pred_findings: Sequence[Finding],
+        *,
+        min_span_score: float,
+        require_exact_subclass: bool = True,
 ) -> List[MatchCandidate]:
     candidates: List[MatchCandidate] = []
     for gi, gold in enumerate(gold_findings):
@@ -288,11 +367,11 @@ def build_candidates(
                 correction_match = None
 
             score = (
-                100.0
-                + 20.0 * s_score
-                + (5.0 if change_match else 0.0)
-                + (2.0 if severity_match else 0.0)
-                + (1.0 if correction_match is True else 0.0)
+                    100.0
+                    + 20.0 * s_score
+                    + (5.0 if change_match else 0.0)
+                    + (2.0 if severity_match else 0.0)
+                    + (1.0 if correction_match is True else 0.0)
             )
             candidates.append(
                 MatchCandidate(
@@ -320,11 +399,11 @@ def build_candidates(
 
 
 def greedy_match_findings(
-    gold_findings: Sequence[Finding],
-    pred_findings: Sequence[Finding],
-    *,
-    min_span_score: float,
-    require_exact_subclass: bool = True,
+        gold_findings: Sequence[Finding],
+        pred_findings: Sequence[Finding],
+        *,
+        min_span_score: float,
+        require_exact_subclass: bool = True,
 ) -> Tuple[List[MatchedPair], List[Finding], List[Finding]]:
     candidates = build_candidates(
         gold_findings,
@@ -385,10 +464,11 @@ class EvaluationResult:
 
 
 def evaluate_predictions(
-    gold_records: Dict[Tuple[str, str], SegmentRecord],
-    pred_records: Dict[Tuple[str, str], SegmentRecord],
-    *,
-    min_span_score: float,
+        gold_records: Dict[Tuple[str, str], SegmentRecord],
+        pred_records: Dict[Tuple[str, str], SegmentRecord],
+        *,
+        min_span_score: float,
+        require_exact_subclass: bool = True,
 ) -> EvaluationResult:
     keys = sorted(set(gold_records.keys()) | set(pred_records.keys()))
 
@@ -427,7 +507,7 @@ def evaluate_predictions(
             gold_findings,
             pred_findings,
             min_span_score=min_span_score,
-            require_exact_subclass=True,
+            require_exact_subclass=require_exact_subclass,
         )
 
         tp += len(matches)
@@ -505,6 +585,31 @@ def evaluate_predictions(
     overall = prf(tp, fp, fn)
     segment_overall = prf(segment_tp, segment_fp, segment_fn)
 
+    # ── Document-level evaluation ─────────────────────────────────────────────
+    # Collect all gold and pred findings per case_id, ignoring segment boundaries.
+    # This handles segmentation mismatch between annotation and pipeline runs.
+    from collections import defaultdict as _dd
+    case_gold: dict = _dd(list)
+    case_pred: dict = _dd(list)
+    for key, seg in gold_records.items():
+        case_gold[key[0]].extend(seg.findings)
+    for key, seg in pred_records.items():
+        case_pred[key[0]].extend(seg.findings)
+
+    doc_tp = doc_fp = doc_fn = 0
+    for cid in sorted(set(case_gold) | set(case_pred)):
+        gf = case_gold.get(cid, [])
+        pf = case_pred.get(cid, [])
+        doc_matches, doc_ug, doc_up = greedy_match_findings(
+            gf, pf,
+            min_span_score=min_span_score,
+            require_exact_subclass=False,
+        )
+        doc_tp += len(doc_matches)
+        doc_fn += len(doc_ug)
+        doc_fp += len(doc_up)
+    doc_overall = prf(doc_tp, doc_fp, doc_fn)
+
     per_subclass: Dict[str, Dict[str, Any]] = {}
     all_subclasses = sorted(set(subclass_tp) | set(subclass_fp) | set(subclass_fn))
     for subclass_id in all_subclasses:
@@ -519,12 +624,61 @@ def evaluate_predictions(
             **metrics,
         }
 
+    # ── Lenient pass: match on main class prefix only (e.g. RECHT vs STRUKT) ──
+    ltp = lfp = lfn = 0
+    for key in keys:
+        gold_seg = gold_records.get(key)
+        pred_seg = pred_records.get(key)
+        gold_findings_l = list(gold_seg.findings if gold_seg else ())
+        pred_findings_l = list(pred_seg.findings if pred_seg else ())
+
+        # Temporarily relax subclass to main class for matching
+        def _main_match(g: Finding, p: Finding) -> bool:
+            return (g.main_class_id == p.main_class_id) or (not g.main_class_id) or (not p.main_class_id)
+
+        used_gold_l: set = set()
+        used_pred_l: set = set()
+        for gi, gold in enumerate(gold_findings_l):
+            for pi, pred in enumerate(pred_findings_l):
+                if gi in used_gold_l or pi in used_pred_l:
+                    continue
+                if not _main_match(gold, pred):
+                    continue
+                if span_match_score(gold.span_text, pred.span_text) >= min_span_score:
+                    used_gold_l.add(gi)
+                    used_pred_l.add(pi)
+                    ltp += 1
+        lfn += len(gold_findings_l) - len(used_gold_l)
+        lfp += len(pred_findings_l) - len(used_pred_l)
+
+    lenient_overall = prf(ltp, lfp, lfn)
+
     summary = {
+        "finding_level_strict": {
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            **overall,
+        },
         "finding_level": {
             "tp": tp,
             "fp": fp,
             "fn": fn,
             **overall,
+        },
+        "finding_level_document": {
+            "tp": doc_tp,
+            "fp": doc_fp,
+            "fn": doc_fn,
+            **doc_overall,
+            "note": "document-level match (no segment boundary, main class + span)",
+        },
+        "finding_level_lenient": {
+            "tp": ltp,
+            "fp": lfp,
+            "fn": lfn,
+            **lenient_overall,
+            "note": "main class match + span overlap only (subclass not required)",
         },
         "segment_level_detection": {
             "tp": segment_tp,
@@ -592,12 +746,13 @@ def write_per_subclass_csv(path: Path, per_subclass: Dict[str, Dict[str, Any]]) 
 def print_human_summary(result: EvaluationResult) -> None:
     s = result.summary
     fl = s["finding_level"]
+    fl_l = s.get("finding_level_lenient", {})
     seg = s["segment_level_detection"]
 
     print("=" * 90)
     print("EVALUATION SUMMARY")
     print("=" * 90)
-    print("Finding level")
+    print("Finding level — STRICT (exact subclass + span)")
     print(f"  TP: {fl['tp']}")
     print(f"  FP: {fl['fp']}")
     print(f"  FN: {fl['fn']}")
@@ -605,6 +760,25 @@ def print_human_summary(result: EvaluationResult) -> None:
     print(f"  Recall:    {fl['recall']:.4f}")
     print(f"  F1:        {fl['f1']:.4f}")
     print("")
+    fl_d = s.get("finding_level_document", {})
+    if fl_d:
+        print("Finding level — DOCUMENT (no segment boundary, main class + span)")
+        print(f"  TP: {fl_d.get('tp', 0)}")
+        print(f"  FP: {fl_d.get('fp', 0)}")
+        print(f"  FN: {fl_d.get('fn', 0)}")
+        print(f"  Precision: {fl_d.get('precision', 0):.4f}")
+        print(f"  Recall:    {fl_d.get('recall', 0):.4f}")
+        print(f"  F1:        {fl_d.get('f1', 0):.4f}")
+        print("")
+    if fl_l:
+        print("Finding level — LENIENT (main class + span, subclass not required)")
+        print(f"  TP: {fl_l.get('tp', 0)}")
+        print(f"  FP: {fl_l.get('fp', 0)}")
+        print(f"  FN: {fl_l.get('fn', 0)}")
+        print(f"  Precision: {fl_l.get('precision', 0):.4f}")
+        print(f"  Recall:    {fl_l.get('recall', 0):.4f}")
+        print(f"  F1:        {fl_l.get('f1', 0):.4f}")
+        print("")
     print("Segment level detection")
     print(f"  TP: {seg['tp']}")
     print(f"  FP: {seg['fp']}")
@@ -629,12 +803,19 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--ground_truth_jsonl", required=True, help="Path to ground truth JSONL")
     ap.add_argument("--predictions_jsonl", required=True, help="Path to predictions JSONL")
+    ap.add_argument("--case_id", default="", help="Optional case_id filter when ground truth contains multiple cases")
     ap.add_argument("--taxonomy_json", default="", help="Optional taxonomy JSON for ID validation")
     ap.add_argument(
         "--min_span_score",
         type=float,
         default=0.60,
         help="Minimum fuzzy span score for matching within a segment (default: 0.60)",
+    )
+    ap.add_argument(
+        "--require_exact_subclass",
+        action="store_true",
+        default=False,
+        help="Strict mode: require exact subclass_id match (default: False — main class sufficient)",
     )
     ap.add_argument(
         "--output_dir",
@@ -655,10 +836,18 @@ def main() -> None:
     gold_records = load_segment_records(gt_path, findings_field="gold_findings", taxonomy=taxonomy)
     pred_records = load_segment_records(pred_path, findings_field="predicted_findings", taxonomy=taxonomy)
 
+    case_id_filter = str(args.case_id or "").strip()
+    if case_id_filter:
+        gold_records = {k: v for k, v in gold_records.items() if k[0] == case_id_filter}
+        pred_records = {k: v for k, v in pred_records.items() if k[0] == case_id_filter}
+        if not gold_records:
+            raise SystemExit(f"No ground-truth records found for case_id={case_id_filter!r} in {gt_path}")
+
     result = evaluate_predictions(
         gold_records,
         pred_records,
         min_span_score=args.min_span_score,
+        require_exact_subclass=args.require_exact_subclass,
     )
 
     print_human_summary(result)

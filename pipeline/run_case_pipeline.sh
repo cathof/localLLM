@@ -8,11 +8,12 @@ Usage:
 
 Runs document checking and evaluation using defaults from .env.
 Works reliably when stored inside a pipeline/ subdirectory.
+Ground truth is per-case: ground_truth_<case_id>.jsonl in GROUND_TRUTH_DIR.
 
 Options:
   --case_id ID           Required, e.g. case_06
   --document PATH        Optional override for case document path
-  --ground_truth PATH    Optional override for ground-truth jsonl
+  --ground_truth PATH    Optional override for shared ground-truth jsonl
   --predictions PATH     Optional override for predictions jsonl
   --eval_output_dir PATH Optional override for evaluation output dir
   --project_dir PATH     Optional explicit project root. Default: parent of script dir
@@ -32,8 +33,8 @@ DOCUMENT_OVERRIDE=""
 GT_OVERRIDE=""
 PRED_OVERRIDE=""
 EVAL_OVERRIDE=""
-PRINT_SOURCES=1
-PRINT_CONTEXT=1
+PRINT_SOURCES=0
+PRINT_CONTEXT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,6 +74,12 @@ fi
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 cd "$PROJECT_DIR"
 
+LOGS_DIR="${LOGS_DIR:-./logs}"
+mkdir -p "$LOGS_DIR"
+LOG_FILE="${LOGS_DIR}/case_pipeline_${CASE_ID}_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[INFO] Log: $LOG_FILE"
+
 if [[ -f "$PROJECT_DIR/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -80,10 +87,12 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
   set +a
 fi
 
+# Defaults from .env, with safe fallbacks matching the project structure.
 CASE_DOC_DIR="${CASE_DOC_DIR:-./case_documents}"
 PREDICTIONS_DIR="${PREDICTIONS_DIR:-./predictions}"
 EVAL_OUTPUT_BASE="${EVAL_OUTPUT_BASE:-./eval_results}"
 GROUND_TRUTH_DIR="${GROUND_TRUTH_DIR:-./ground_truth}"
+GROUND_TRUTH_JSONL="${GROUND_TRUTH_JSONL:-${GROUND_TRUTH_DIR%/}/ground_truth_${CASE_ID}.jsonl}"
 TAXONOMY_JSON="${TAXONOMY_JSON:-./tax/taxonomy.json}"
 EMBED_OUT_NPZ="${EMBED_OUT_NPZ:-embeddings_rules.npz}"
 EMBED_OUT_INDEX="${EMBED_OUT_INDEX:-index_rules.jsonl}"
@@ -92,18 +101,22 @@ EMBED_OUT_NPZ2="${EMBED_OUT_NPZ2:-embeddings_materials.npz}"
 EMBED_OUT_INDEX2="${EMBED_OUT_INDEX2:-index_materials.jsonl}"
 OUT_JSONL2="${OUT_JSONL2:-prepared_materials.jsonl}"
 
-RAG_SCRIPT="${RAG_SCRIPT:-rag_answer_multi_query_diverse_rewritten.py}"
-EVAL_SCRIPT="${EVAL_SCRIPT:-evaluate_predictions.py}"
-
 DOCUMENT_PATH="${DOCUMENT_OVERRIDE:-${CASE_DOC_DIR%/}/${CASE_ID}.docx}"
-GROUND_TRUTH_PATH="${GT_OVERRIDE:-${GROUND_TRUTH_DIR%/}/ground_truth_${CASE_ID}.jsonl}"
+GROUND_TRUTH_PATH="${GT_OVERRIDE:-$GROUND_TRUTH_JSONL}"
 PREDICTIONS_PATH="${PRED_OVERRIDE:-${PREDICTIONS_DIR%/}/predictions_${CASE_ID}.jsonl}"
 EVAL_OUTPUT_DIR="${EVAL_OVERRIDE:-${EVAL_OUTPUT_BASE%/}/${CASE_ID}}"
 
 mkdir -p "$(dirname "$PREDICTIONS_PATH")" "$EVAL_OUTPUT_DIR"
 
+for required in "$DOCUMENT_PATH" "$GROUND_TRUTH_PATH" "$TAXONOMY_JSON" "$EMBED_OUT_NPZ" "$EMBED_OUT_INDEX" "$OUT_JSONL" "$EMBED_OUT_NPZ2" "$EMBED_OUT_INDEX2" "$OUT_JSONL2"; do
+  if [[ ! -f "$required" ]]; then
+    echo "Error: required file not found: $required" >&2
+    exit 1
+  fi
+done
+
 RAG_CMD=(
-  "$PYTHON_BIN" "$RAG_SCRIPT"
+  "$PYTHON_BIN" rag_answer_multi_query_diverse_rewritten.py
   --document "$DOCUMENT_PATH"
   --case_id "$CASE_ID"
   --taxonomy_json "$TAXONOMY_JSON"
@@ -115,6 +128,7 @@ RAG_CMD=(
   --prepared2 "$OUT_JSONL2"
   --save_predictions_jsonl "$PREDICTIONS_PATH"
 )
+
 if [[ "$PRINT_SOURCES" -eq 1 ]]; then
   RAG_CMD+=(--print_sources)
 fi
@@ -123,33 +137,35 @@ if [[ "$PRINT_CONTEXT" -eq 1 ]]; then
 fi
 
 EVAL_CMD=(
-  "$PYTHON_BIN" "$EVAL_SCRIPT"
+  "$PYTHON_BIN" evaluate_predictions.py
   --ground_truth_jsonl "$GROUND_TRUTH_PATH"
   --predictions_jsonl "$PREDICTIONS_PATH"
+  --case_id "$CASE_ID"
   --taxonomy_json "$TAXONOMY_JSON"
   --output_dir "$EVAL_OUTPUT_DIR"
 )
 
-echo "Project dir      : $PROJECT_DIR"
-echo "Script dir       : $SCRIPT_DIR"
-echo "Python           : $PYTHON_BIN"
-echo "Case ID          : $CASE_ID"
-echo "Document         : $DOCUMENT_PATH"
-echo "Ground truth     : $GROUND_TRUTH_PATH"
-echo "Predictions      : $PREDICTIONS_PATH"
-echo "Eval output dir  : $EVAL_OUTPUT_DIR"
-echo "Taxonomy         : $TAXONOMY_JSON"
-echo "Rules embeddings : $EMBED_OUT_NPZ"
-echo "Rules index      : $EMBED_OUT_INDEX"
-echo "Rules prepared   : $OUT_JSONL"
-echo "Materials emb    : $EMBED_OUT_NPZ2"
-echo "Materials index  : $EMBED_OUT_INDEX2"
-echo "Materials prep   : $OUT_JSONL2"
+echo "========================================================================"
+echo "CASE PIPELINE"
+echo "========================================================================"
+echo "project_dir      : $PROJECT_DIR"
+echo "case_id          : $CASE_ID"
+echo "document         : $DOCUMENT_PATH"
+echo "ground_truth     : $GROUND_TRUTH_PATH"
+echo "predictions_jsonl: $PREDICTIONS_PATH"
+echo "eval_output_dir  : $EVAL_OUTPUT_DIR"
+echo "taxonomy         : $TAXONOMY_JSON"
+echo "========================================================================"
+
 echo
-printf 'Running: '; printf '%q ' "${RAG_CMD[@]}"; echo
+printf '>>> Running detection: '; printf '%q ' "${RAG_CMD[@]}"; echo
 "${RAG_CMD[@]}"
+
 echo
-printf 'Running: '; printf '%q ' "${EVAL_CMD[@]}"; echo
+printf '>>> Running evaluation: '; printf '%q ' "${EVAL_CMD[@]}"; echo
 "${EVAL_CMD[@]}"
+
 echo
 echo "Done."
+echo "Predictions: $PREDICTIONS_PATH"
+echo "Evaluation : $EVAL_OUTPUT_DIR"
