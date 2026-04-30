@@ -1873,6 +1873,31 @@ def iter_records_for_path(
         **read_meta,
     })
 
+    # ── Ingestion-time vision captioning ────────────────────────────────────────
+    # Captions are appended to the extracted text so they are embedded with
+    # the chunk and participate in semantic search. This avoids the need to
+    # call the vision model at inference time (which caused GPU memory contention
+    # with the main LLM).
+    vision_model = str(cfg.get("vision_model") or "").strip()
+    if vision_model and base_meta.get("embedded_images"):
+        _captions: list[str] = []
+        for _img_path in base_meta["embedded_images"]:
+            _p = Path(_img_path)
+            if not _p.exists():
+                continue
+            try:
+                _caption = ollama_caption_png(cfg=cfg, png_bytes=_p.read_bytes())
+                if _caption:
+                    _captions.append(_caption)
+                    log(f"captioned image: {_p.name}", level="INFO", cfg=cfg)
+            except Exception as _e:
+                log(f"vision caption failed for {_p.name}: {_e}", level="WARN", cfg=cfg)
+        if _captions:
+            text = text.rstrip()
+            for _i, _cap in enumerate(_captions, 1):
+                text = text + ("\n\n[Bild " + str(_i) + "]: " + _cap)
+            base_meta["image_captions"] = _captions
+
     chunk_size_tokens = int(cfg.get("chunk_size_tokens") or CHUNK_SIZE_TOKENS_DEFAULT)
     chunk_overlap_tokens = int(cfg.get("chunk_overlap_tokens") or CHUNK_OVERLAP_TOKENS_DEFAULT)
     min_chunk_tokens = int(cfg.get("min_chunk_tokens") or MIN_CHUNK_TOKENS_DEFAULT)
