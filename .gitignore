@@ -3,6 +3,8 @@ data/
 data/**
 data_unused/
 data_unused/**
+cases/
+cases/**
 
 # --- Python ---
 __pycache__/
@@ -28,7 +30,11 @@ Thumbs.db
 
 # --- Logs / outputs ---
 *.log
-prepared.jsonl
+prepared_materials.jsonl
+prepared_rules.jsonl
+embeddings_rules.npz
+embeddings_materials.npz
+embeddings.npz
 *.jsonl
 .cache/
 .cache/**

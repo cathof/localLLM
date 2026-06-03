@@ -143,9 +143,39 @@ def jaccard_similarity(a: str, b: str) -> float:
     return inter / union if union else 0.0
 
 
+def _char_bigrams_simplified(s: str) -> set[str]:
+    """Character bigrams on already simplified text (punctuation stripped, casefolded)."""
+    s = (s or "").replace(" ", "")
+    if not s:
+        return set()
+    if len(s) < 2:
+        return {s}
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _dice_similarity(a: set[str], b: set[str]) -> float:
+    """Dice coefficient for set overlap."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return (2.0 * inter) / (len(a) + len(b))
+
+
 def span_match_score(gold_span: str, pred_span: str) -> float:
+    """Hybrid span similarity for evaluation.
+
+    Strategy:
+      1) simplify_text() on both spans
+      2) exact match → 1.0
+      3) containment (one in the other) → high score
+      4) otherwise: max(token-Jaccard, char-bigram Dice)
+         with a stricter behaviour for very short spans
+    """
     g = simplify_text(gold_span)
     p = simplify_text(pred_span)
+
     if not g and not p:
         return 1.0
     if not g or not p:
@@ -153,8 +183,27 @@ def span_match_score(gold_span: str, pred_span: str) -> float:
     if g == p:
         return 1.0
     if g in p or p in g:
-        return 0.9
-    return jaccard_similarity(g, p)
+        return 0.95
+
+    # token Jaccard on already-simplified text
+    gtoks = {t for t in g.split(" ") if t}
+    ptoks = {t for t in p.split(" ") if t}
+    if not gtoks and not ptoks:
+        token_j = 1.0
+    elif not gtoks or not ptoks:
+        token_j = 0.0
+    else:
+        token_j = len(gtoks & ptoks) / len(gtoks | ptoks)
+
+    # char-bigram Dice on already-simplified text
+    char_d = _dice_similarity(_char_bigrams_simplified(g), _char_bigrams_simplified(p))
+
+    # Short-span guardrail: token-set similarity is unreliable for 1–2 tokens.
+    short = (len(g) < 12 or len(p) < 12 or (len(gtoks) <= 2 and len(ptoks) <= 2))
+    if short:
+        return max(0.5 * token_j, char_d)
+
+    return max(token_j, char_d)
 
 
 # ── Taxonomy validation ───────────────────────────────────────────────────────
@@ -164,6 +213,39 @@ class TaxonomyLookup:
     subclass_ids: set[str]
     change_type_ids: set[str]
     severity_ids: set[str]
+    subclass_to_main: Dict[str, str]
+    id_by_label: Dict[str, str]
+
+
+def _label_key(value: Any) -> str:
+    return simplify_text(str(value or ""))
+
+
+def _first_nonempty(*values: Any) -> str:
+    for value in values:
+        s = str(value or "").strip()
+        if s:
+            return s
+    return ""
+
+
+COMPATIBILITY_ID_ALIASES = {
+    # Older ground-truth files used this split; taxonomy v1.0.0 contains the
+    # broader arithmetic / conversion class instead.
+    "RECHEN_EINHEIT": "RECHEN_ARITHMETIK",
+}
+
+
+def _resolve_taxonomy_value(value: Any, taxonomy: Optional[TaxonomyLookup]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw = COMPATIBILITY_ID_ALIASES.get(raw, raw)
+    if taxonomy is None:
+        return raw
+    if raw in taxonomy.subclass_ids or raw in taxonomy.change_type_ids or raw in taxonomy.severity_ids:
+        return raw
+    return taxonomy.id_by_label.get(_label_key(raw), raw)
 
 
 def load_taxonomy_lookup(path: Optional[Path]) -> Optional[TaxonomyLookup]:
@@ -172,30 +254,59 @@ def load_taxonomy_lookup(path: Optional[Path]) -> Optional[TaxonomyLookup]:
     raw = load_json(path)
 
     subclass_ids: set[str] = set()
+    subclass_to_main: Dict[str, str] = {}
+    id_by_label: Dict[str, str] = {}
+
     for main in raw.get("main_classes", []):
         if not isinstance(main, dict):
             continue
+        main_id = str(main.get("id") or "").strip()
+        main_label = str(main.get("label") or "").strip()
+        if main_id:
+            id_by_label[_label_key(main_id)] = main_id
+        if main_label and main_id:
+            id_by_label[_label_key(main_label)] = main_id
         for sub in main.get("subclasses", []):
             if isinstance(sub, dict):
                 sub_id = str(sub.get("id") or "").strip()
+                sub_label = str(sub.get("label") or "").strip()
                 if sub_id:
                     subclass_ids.add(sub_id)
+                    subclass_to_main[sub_id] = main_id
+                    id_by_label[_label_key(sub_id)] = sub_id
+                if sub_label and sub_id:
+                    id_by_label[_label_key(sub_label)] = sub_id
 
-    change_type_ids = {
-        str(x.get("id") or "").strip()
-        for x in raw.get("change_types", [])
-        if isinstance(x, dict) and str(x.get("id") or "").strip()
-    }
-    severity_ids = {
-        str(x.get("id") or "").strip()
-        for x in raw.get("severity_levels", [])
-        if isinstance(x, dict) and str(x.get("id") or "").strip()
-    }
+    change_type_ids: set[str] = set()
+    for x in raw.get("change_types", []):
+        if not isinstance(x, dict):
+            continue
+        x_id = str(x.get("id") or "").strip()
+        x_label = str(x.get("label") or "").strip()
+        if x_id:
+            change_type_ids.add(x_id)
+            id_by_label[_label_key(x_id)] = x_id
+        if x_label and x_id:
+            id_by_label[_label_key(x_label)] = x_id
+
+    severity_ids: set[str] = set()
+    for x in raw.get("severity_levels", []):
+        if not isinstance(x, dict):
+            continue
+        x_id = str(x.get("id") or "").strip()
+        x_label = str(x.get("label") or "").strip()
+        if x_id:
+            severity_ids.add(x_id)
+            id_by_label[_label_key(x_id)] = x_id
+        if x_label and x_id:
+            id_by_label[_label_key(x_label)] = x_id
 
     return TaxonomyLookup(
         subclass_ids=subclass_ids,
         change_type_ids=change_type_ids,
         severity_ids=severity_ids,
+        subclass_to_main=subclass_to_main,
+        id_by_label=id_by_label,
     )
 
 
@@ -211,6 +322,7 @@ class Finding:
     correction: str = ""
     rationale: str = ""
     source: str = ""
+    taxonomy_main_class_id: str = ""
 
     @property
     def normalized_span(self) -> str:
@@ -222,8 +334,28 @@ class Finding:
 
     @property
     def main_class_id(self) -> str:
-        """Derive main class prefix from subclass_id: RECHT_TRENNUNG → RECHT"""
+        """Main class from taxonomy; fallback to prefix for legacy IDs."""
+        if self.taxonomy_main_class_id:
+            return self.taxonomy_main_class_id
         return self.subclass_id.split("_")[0] if self.subclass_id else ""
+
+    @property
+    def agent_scope(self) -> str:
+        """Coarse scope used only for diagnostics.
+
+        The newest pipeline flattens all agent outputs into predicted_findings
+        before writing JSONL. Therefore the evaluator cannot always recover the
+        exact producing agent. It can, however, identify global hypothesis
+        findings from the taxonomy main class and keep the rest as standard
+        finding records.
+        """
+        if self.main_class_id == "HYPOTHESEN":
+            return "document_hypothesis"
+        if self.main_class_id == "RECHENFEHLER":
+            return "segment_calculation"
+        if self.main_class_id == "FORMALES":
+            return "segment_language"
+        return "segment_or_document_factual"
 
 
 @dataclass(frozen=True)
@@ -281,15 +413,54 @@ def load_segment_records(
         for item in findings_raw:
             if not isinstance(item, dict):
                 raise RuntimeError(f"{path}: findings must contain objects")
+            subclass_id = _resolve_taxonomy_value(
+                _first_nonempty(
+                    item.get("subclass_id"),
+                    item.get("subklasse_id"),
+                    item.get("subcategory_id"),
+                    item.get("subclass"),
+                    item.get("subklasse"),
+                    item.get("subcategory"),
+                ),
+                taxonomy,
+            )
+            change_type_id = _resolve_taxonomy_value(
+                _first_nonempty(
+                    item.get("change_type_id"),
+                    item.get("aenderungstyp_id"),
+                    item.get("änderungstyp_id"),
+                    item.get("change_type"),
+                    item.get("aenderungstyp"),
+                    item.get("änderungstyp"),
+                ),
+                taxonomy,
+            )
+            severity_id = _resolve_taxonomy_value(
+                _first_nonempty(
+                    item.get("severity_id"),
+                    item.get("schweregrad_id"),
+                    item.get("severity"),
+                    item.get("schweregrad"),
+                ),
+                taxonomy,
+            )
+            span_text = _first_nonempty(
+                item.get("span_text"),
+                item.get("stelle"),
+                item.get("textstelle"),
+                item.get("quote"),
+                item.get("excerpt"),
+            )
             finding = Finding(
-                finding_id=str(item.get("finding_id") or "").strip(),
-                subclass_id=str(item.get("subclass_id") or "").strip(),
-                change_type_id=str(item.get("change_type_id") or "").strip(),
-                severity_id=str(item.get("severity_id") or "").strip(),
-                span_text=str(item.get("span_text") or "").strip(),
-                correction=str(item.get("correction") or "").strip(),
-                rationale=str(item.get("rationale") or "").strip(),
-                source=str(item.get("source") or "").strip(),
+                finding_id=str(item.get("finding_id") or item.get("id") or "").strip(),
+                subclass_id=subclass_id,
+                change_type_id=change_type_id,
+                severity_id=severity_id,
+                span_text=span_text,
+                correction=str(item.get("correction") or item.get("vorschlag") or item.get("suggestion") or "").strip(),
+                rationale=str(item.get("rationale") or item.get("begründung") or item.get("begruendung") or "").strip(),
+                source=str(item.get("source") or item.get("source_refs") or "").strip(),
+                taxonomy_main_class_id=(taxonomy.subclass_to_main.get(subclass_id, "") if taxonomy else ""),
             )
             if not finding.finding_id:
                 raise RuntimeError(f"{path}: missing finding_id in segment {segment_id}")
@@ -351,7 +522,10 @@ def build_candidates(
     candidates: List[MatchCandidate] = []
     for gi, gold in enumerate(gold_findings):
         for pi, pred in enumerate(pred_findings):
-            if require_exact_subclass and gold.subclass_id != pred.subclass_id:
+            if require_exact_subclass:
+                if gold.subclass_id != pred.subclass_id:
+                    continue
+            elif gold.main_class_id and pred.main_class_id and gold.main_class_id != pred.main_class_id:
                 continue
 
             s_score = span_match_score(gold.span_text, pred.span_text)
@@ -438,6 +612,69 @@ def greedy_match_findings(
     return matches, unmatched_gold, unmatched_pred
 
 
+def _finding_row(f: Finding, *, prefix: str = "") -> Dict[str, Any]:
+    """Serialize a Finding for debug artifacts."""
+    p = f"{prefix}_" if prefix else ""
+    return {
+        f"{p}finding_id": f.finding_id,
+        f"{p}main_class_id": f.main_class_id,
+        f"{p}subclass_id": f.subclass_id,
+        f"{p}change_type_id": f.change_type_id,
+        f"{p}severity_id": f.severity_id,
+        f"{p}span_text": f.span_text,
+        f"{p}correction": f.correction,
+        f"{p}rationale": f.rationale,
+        f"{p}agent_scope": f.agent_scope,
+    }
+
+
+def best_span_candidates(
+        target: Finding,
+        candidates: Sequence[Finding],
+        *,
+        limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Return the best unmatched candidates by span overlap for debugging.
+
+    This does not change evaluation counts. It only explains why a finding did
+    or did not match, especially after adding document-level agents whose
+    findings may land in another segment.
+    """
+    scored: List[Tuple[float, Finding]] = [
+        (span_match_score(target.span_text, cand.span_text), cand)
+        for cand in candidates
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for score, cand in scored[:limit]:
+        row = _finding_row(cand, prefix="candidate")
+        row["span_score"] = round(score, 4)
+        row["same_subclass"] = target.subclass_id == cand.subclass_id
+        row["same_main_class"] = target.main_class_id == cand.main_class_id
+        row["same_change_type"] = target.change_type_id == cand.change_type_id
+        row["same_severity"] = target.severity_id == cand.severity_id
+        out.append(row)
+    return out
+
+
+def summarize_matches(matches: Sequence[MatchedPair], *, case_id: str = "", segment_id: str = "") -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for match in matches:
+        row = {
+            "case_id": case_id,
+            "segment_id": segment_id,
+            **_finding_row(match.gold, prefix="gold"),
+            **_finding_row(match.pred, prefix="pred"),
+            "score": round(match.score, 4),
+            "span_score": round(match.span_score, 4),
+            "change_match": match.change_match,
+            "severity_match": match.severity_match,
+            "correction_match": match.correction_match,
+        }
+        rows.append(row)
+    return rows
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
 def safe_div(num: float, den: float) -> float:
@@ -460,7 +697,10 @@ class EvaluationResult:
     false_positives: List[Dict[str, Any]]
     matches: List[Dict[str, Any]]
     per_subclass: Dict[str, Dict[str, Any]]
+    per_main_class: Dict[str, Dict[str, Any]]
     confusion: Dict[str, Dict[str, int]]
+    document_strict_matches: List[Dict[str, Any]] = field(default_factory=list)
+    document_lenient_matches: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def evaluate_predictions(
@@ -470,44 +710,143 @@ def evaluate_predictions(
         min_span_score: float,
         require_exact_subclass: bool = True,
 ) -> EvaluationResult:
-    keys = sorted(set(gold_records.keys()) | set(pred_records.keys()))
+    """
+    Span-only evaluation.
+
+    Wichtig:
+    - Segmentgrenzen werden ignoriert.
+    - Fehlerkategorien/Subklassen werden für das Matching ignoriert.
+    - Gematcht wird ausschliesslich über span_text innerhalb desselben case_id.
+    - subclass_id, change_type_id, severity_id und correction werden nur noch
+      diagnostisch ausgewertet, aber nicht als Match-Bedingung verwendet.
+
+    Damit wird ein Prediction-Finding als Treffer gezählt, wenn sein span_text
+    genügend ähnlich zu einem Ground-Truth-span_text desselben Falls ist.
+    """
+    from collections import defaultdict as _dd
+
+    case_gold: Dict[str, List[Finding]] = _dd(list)
+    case_pred: Dict[str, List[Finding]] = _dd(list)
+
+    for (case_id, _segment_id), seg in gold_records.items():
+        case_gold[case_id].extend(seg.findings)
+
+    for (case_id, _segment_id), seg in pred_records.items():
+        case_pred[case_id].extend(seg.findings)
+
+    all_case_ids = sorted(set(case_gold) | set(case_pred))
 
     tp = fp = fn = 0
-    segment_tp = segment_fp = segment_fn = 0
-
     matched_rows: List[Dict[str, Any]] = []
     false_negatives: List[Dict[str, Any]] = []
     false_positives: List[Dict[str, Any]] = []
 
     change_correct = 0
     severity_correct = 0
+    subclass_correct = 0
     correction_considered = 0
     correction_correct = 0
 
     subclass_tp = Counter()
     subclass_fp = Counter()
     subclass_fn = Counter()
+    main_tp = Counter()
+    main_fp = Counter()
+    main_fn = Counter()
     confusion: Dict[str, Counter] = defaultdict(Counter)
 
-    for key in keys:
-        gold_seg = gold_records.get(key)
-        pred_seg = pred_records.get(key)
+    document_strict_matches: List[Dict[str, Any]] = []
+    document_lenient_matches: List[Dict[str, Any]] = []
 
-        gold_findings = list(gold_seg.findings if gold_seg else ())
-        pred_findings = list(pred_seg.findings if pred_seg else ())
+    def _build_span_only_candidates(
+            gold_findings: Sequence[Finding],
+            pred_findings: Sequence[Finding],
+    ) -> List[MatchCandidate]:
+        candidates: List[MatchCandidate] = []
+        for gi, gold in enumerate(gold_findings):
+            for pi, pred in enumerate(pred_findings):
+                s_score = span_match_score(gold.span_text, pred.span_text)
+                if s_score < min_span_score:
+                    continue
 
-        if gold_findings and pred_findings:
-            segment_tp += 1
-        elif gold_findings and not pred_findings:
-            segment_fn += 1
-        elif pred_findings and not gold_findings:
-            segment_fp += 1
+                change_match = gold.change_type_id == pred.change_type_id
+                severity_match = gold.severity_id == pred.severity_id
 
-        matches, unmatched_gold, unmatched_pred = greedy_match_findings(
+                if gold.correction or pred.correction:
+                    correction_match: Optional[bool] = gold.normalized_correction == pred.normalized_correction
+                else:
+                    correction_match = None
+
+                # Match-Score priorisiert ausschliesslich den Span.
+                # Weitere Felder dienen nur als Tie-Breaker, nicht als Filter.
+                score = (
+                        100.0
+                        + 100.0 * s_score
+                        + (0.5 if gold.subclass_id == pred.subclass_id else 0.0)
+                        + (0.2 if change_match else 0.0)
+                        + (0.1 if severity_match else 0.0)
+                )
+
+                candidates.append(
+                    MatchCandidate(
+                        gold_idx=gi,
+                        pred_idx=pi,
+                        score=score,
+                        span_score=s_score,
+                        change_match=change_match,
+                        severity_match=severity_match,
+                        correction_match=correction_match,
+                    )
+                )
+
+        candidates.sort(
+            key=lambda c: (
+                -c.span_score,
+                -c.score,
+                c.gold_idx,
+                c.pred_idx,
+            )
+        )
+        return candidates
+
+    def _greedy_span_only_match(
+            gold_findings: Sequence[Finding],
+            pred_findings: Sequence[Finding],
+    ) -> Tuple[List[MatchedPair], List[Finding], List[Finding]]:
+        candidates = _build_span_only_candidates(gold_findings, pred_findings)
+
+        used_gold: set[int] = set()
+        used_pred: set[int] = set()
+        matches: List[MatchedPair] = []
+
+        for cand in candidates:
+            if cand.gold_idx in used_gold or cand.pred_idx in used_pred:
+                continue
+            used_gold.add(cand.gold_idx)
+            used_pred.add(cand.pred_idx)
+            matches.append(
+                MatchedPair(
+                    gold=gold_findings[cand.gold_idx],
+                    pred=pred_findings[cand.pred_idx],
+                    score=cand.score,
+                    span_score=cand.span_score,
+                    change_match=cand.change_match,
+                    severity_match=cand.severity_match,
+                    correction_match=cand.correction_match,
+                )
+            )
+
+        unmatched_gold = [g for i, g in enumerate(gold_findings) if i not in used_gold]
+        unmatched_pred = [p for i, p in enumerate(pred_findings) if i not in used_pred]
+        return matches, unmatched_gold, unmatched_pred
+
+    for case_id in all_case_ids:
+        gold_findings = case_gold.get(case_id, [])
+        pred_findings = case_pred.get(case_id, [])
+
+        matches, unmatched_gold, unmatched_pred = _greedy_span_only_match(
             gold_findings,
             pred_findings,
-            min_span_score=min_span_score,
-            require_exact_subclass=require_exact_subclass,
         )
 
         tp += len(matches)
@@ -516,17 +855,23 @@ def evaluate_predictions(
 
         for match in matches:
             subclass_tp[match.gold.subclass_id] += 1
+            main_tp[match.gold.main_class_id] += 1
+
             change_correct += int(match.change_match)
             severity_correct += int(match.severity_match)
+            subclass_correct += int(match.gold.subclass_id == match.pred.subclass_id)
+
             if match.correction_match is not None:
                 correction_considered += 1
                 correction_correct += int(match.correction_match)
 
-            matched_rows.append({
-                "case_id": key[0],
-                "segment_id": key[1],
+            row = {
+                "case_id": case_id,
+                "segment_id": "SPAN_ONLY",
                 "gold_finding_id": match.gold.finding_id,
                 "pred_finding_id": match.pred.finding_id,
+                "gold_main_class_id": match.gold.main_class_id,
+                "pred_main_class_id": match.pred.main_class_id,
                 "gold_subclass_id": match.gold.subclass_id,
                 "pred_subclass_id": match.pred.subclass_id,
                 "gold_change_type_id": match.gold.change_type_id,
@@ -536,37 +881,33 @@ def evaluate_predictions(
                 "gold_span_text": match.gold.span_text,
                 "pred_span_text": match.pred.span_text,
                 "span_score": round(match.span_score, 4),
+                "subclass_match": match.gold.subclass_id == match.pred.subclass_id,
                 "change_match": match.change_match,
                 "severity_match": match.severity_match,
                 "correction_match": match.correction_match,
-            })
+            }
+            matched_rows.append(row)
 
         for gold in unmatched_gold:
             subclass_fn[gold.subclass_id] += 1
+            main_fn[gold.main_class_id] += 1
             false_negatives.append({
-                "case_id": key[0],
-                "segment_id": key[1],
-                "finding_id": gold.finding_id,
-                "subclass_id": gold.subclass_id,
-                "change_type_id": gold.change_type_id,
-                "severity_id": gold.severity_id,
-                "span_text": gold.span_text,
-                "correction": gold.correction,
-                "rationale": gold.rationale,
+                "case_id": case_id,
+                "segment_id": "SPAN_ONLY",
+                "segment_index": None,
+                **_finding_row(gold),
+                "best_unmatched_predictions_in_case": best_span_candidates(gold, unmatched_pred),
             })
 
         for pred in unmatched_pred:
             subclass_fp[pred.subclass_id] += 1
+            main_fp[pred.main_class_id] += 1
             false_positives.append({
-                "case_id": key[0],
-                "segment_id": key[1],
-                "finding_id": pred.finding_id,
-                "subclass_id": pred.subclass_id,
-                "change_type_id": pred.change_type_id,
-                "severity_id": pred.severity_id,
-                "span_text": pred.span_text,
-                "correction": pred.correction,
-                "rationale": pred.rationale,
+                "case_id": case_id,
+                "segment_id": "SPAN_ONLY",
+                "segment_index": None,
+                **_finding_row(pred),
+                "best_unmatched_gold_in_case": best_span_candidates(pred, unmatched_gold),
             })
 
         if unmatched_gold and unmatched_pred:
@@ -582,33 +923,17 @@ def evaluate_predictions(
                 if scored and scored[0][0] >= min_span_score:
                     confusion[gold.subclass_id][scored[0][1].subclass_id] += 1
 
+        # Die alten Artefaktnamen bleiben aus Kompatibilitätsgründen bestehen.
+        # Inhaltlich sind beide jetzt identisch: case-level span-only matching.
+        document_strict_matches.extend(summarize_matches(matches, case_id=case_id, segment_id="SPAN_ONLY"))
+        document_lenient_matches.extend(summarize_matches(matches, case_id=case_id, segment_id="SPAN_ONLY"))
+
     overall = prf(tp, fp, fn)
+
+    # Segment-Level-Detection ist absichtlich deaktiviert, weil diese Evaluation
+    # keine Segmentgrenzen mehr bewertet.
+    segment_tp = segment_fp = segment_fn = 0
     segment_overall = prf(segment_tp, segment_fp, segment_fn)
-
-    # ── Document-level evaluation ─────────────────────────────────────────────
-    # Collect all gold and pred findings per case_id, ignoring segment boundaries.
-    # This handles segmentation mismatch between annotation and pipeline runs.
-    from collections import defaultdict as _dd
-    case_gold: dict = _dd(list)
-    case_pred: dict = _dd(list)
-    for key, seg in gold_records.items():
-        case_gold[key[0]].extend(seg.findings)
-    for key, seg in pred_records.items():
-        case_pred[key[0]].extend(seg.findings)
-
-    doc_tp = doc_fp = doc_fn = 0
-    for cid in sorted(set(case_gold) | set(case_pred)):
-        gf = case_gold.get(cid, [])
-        pf = case_pred.get(cid, [])
-        doc_matches, doc_ug, doc_up = greedy_match_findings(
-            gf, pf,
-            min_span_score=min_span_score,
-            require_exact_subclass=False,
-        )
-        doc_tp += len(doc_matches)
-        doc_fn += len(doc_ug)
-        doc_fp += len(doc_up)
-    doc_overall = prf(doc_tp, doc_fp, doc_fn)
 
     per_subclass: Dict[str, Dict[str, Any]] = {}
     all_subclasses = sorted(set(subclass_tp) | set(subclass_fp) | set(subclass_fn))
@@ -622,71 +947,77 @@ def evaluate_predictions(
             "fp": sub_fp,
             "fn": sub_fn,
             **metrics,
+            "note": "TP/FN werden der Gold-Subklasse zugeordnet; FP der Pred-Subklasse. Matching selbst ist span-only.",
         }
 
-    # ── Lenient pass: match on main class prefix only (e.g. RECHT vs STRUKT) ──
-    ltp = lfp = lfn = 0
-    for key in keys:
-        gold_seg = gold_records.get(key)
-        pred_seg = pred_records.get(key)
-        gold_findings_l = list(gold_seg.findings if gold_seg else ())
-        pred_findings_l = list(pred_seg.findings if pred_seg else ())
-
-        # Temporarily relax subclass to main class for matching
-        def _main_match(g: Finding, p: Finding) -> bool:
-            return (g.main_class_id == p.main_class_id) or (not g.main_class_id) or (not p.main_class_id)
-
-        used_gold_l: set = set()
-        used_pred_l: set = set()
-        for gi, gold in enumerate(gold_findings_l):
-            for pi, pred in enumerate(pred_findings_l):
-                if gi in used_gold_l or pi in used_pred_l:
-                    continue
-                if not _main_match(gold, pred):
-                    continue
-                if span_match_score(gold.span_text, pred.span_text) >= min_span_score:
-                    used_gold_l.add(gi)
-                    used_pred_l.add(pi)
-                    ltp += 1
-        lfn += len(gold_findings_l) - len(used_gold_l)
-        lfp += len(pred_findings_l) - len(used_pred_l)
-
-    lenient_overall = prf(ltp, lfp, lfn)
+    per_main_class: Dict[str, Dict[str, Any]] = {}
+    all_main_classes = sorted(set(main_tp) | set(main_fp) | set(main_fn))
+    for main_class_id in all_main_classes:
+        m_tp = main_tp[main_class_id]
+        m_fp = main_fp[main_class_id]
+        m_fn = main_fn[main_class_id]
+        metrics = prf(m_tp, m_fp, m_fn)
+        per_main_class[main_class_id] = {
+            "tp": m_tp,
+            "fp": m_fp,
+            "fn": m_fn,
+            **metrics,
+            "note": "TP/FN werden der Gold-Hauptklasse zugeordnet; FP der Pred-Hauptklasse. Matching selbst ist span-only.",
+        }
 
     summary = {
+        "finding_level_span_only": {
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            **overall,
+            "note": "case-level span_text matching only; ignores segment_id, segment_index, subclass_id, change_type_id, severity_id",
+        },
+        # Backward-compatible aliases used by existing print/output code.
         "finding_level_strict": {
             "tp": tp,
             "fp": fp,
             "fn": fn,
             **overall,
+            "note": "alias of finding_level_span_only",
         },
         "finding_level": {
             "tp": tp,
             "fp": fp,
             "fn": fn,
             **overall,
+            "note": "alias of finding_level_span_only",
+        },
+        "finding_level_document_strict": {
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            **overall,
+            "note": "alias of finding_level_span_only",
         },
         "finding_level_document": {
-            "tp": doc_tp,
-            "fp": doc_fp,
-            "fn": doc_fn,
-            **doc_overall,
-            "note": "document-level match (no segment boundary, main class + span)",
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            **overall,
+            "note": "alias of finding_level_span_only",
         },
         "finding_level_lenient": {
-            "tp": ltp,
-            "fp": lfp,
-            "fn": lfn,
-            **lenient_overall,
-            "note": "main class match + span overlap only (subclass not required)",
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            **overall,
+            "note": "alias of finding_level_span_only",
         },
         "segment_level_detection": {
             "tp": segment_tp,
             "fp": segment_fp,
             "fn": segment_fn,
             **segment_overall,
+            "note": "disabled: span-only evaluation ignores segment boundaries",
         },
         "matched_pairs": len(matched_rows),
+        "subclass_accuracy_on_matched": safe_div(subclass_correct, len(matched_rows)),
         "change_type_accuracy_on_matched": safe_div(change_correct, len(matched_rows)),
         "severity_accuracy_on_matched": safe_div(severity_correct, len(matched_rows)),
         "correction_accuracy_on_considered": safe_div(correction_correct, correction_considered),
@@ -694,6 +1025,9 @@ def evaluate_predictions(
         "min_span_score": min_span_score,
         "gold_segments": len(gold_records),
         "pred_segments": len(pred_records),
+        "gold_findings": sum(len(v) for v in case_gold.values()),
+        "pred_findings": sum(len(v) for v in case_pred.values()),
+        "matching_mode": "span_text_only_case_level",
     }
 
     confusion_out = {gold_cls: dict(preds) for gold_cls, preds in confusion.items()}
@@ -704,7 +1038,10 @@ def evaluate_predictions(
         false_positives=false_positives,
         matches=matched_rows,
         per_subclass=per_subclass,
+        per_main_class=per_main_class,
         confusion=confusion_out,
+        document_strict_matches=document_strict_matches,
+        document_lenient_matches=document_lenient_matches,
     )
 
 
@@ -743,56 +1080,78 @@ def write_per_subclass_csv(path: Path, per_subclass: Dict[str, Dict[str, Any]]) 
             ])
 
 
+def write_per_main_class_csv(path: Path, per_main_class: Dict[str, Dict[str, Any]]) -> None:
+    ensure_parent(path)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["main_class_id", "tp", "fp", "fn", "precision", "recall", "f1"])
+        for main_class_id, stats in sorted(per_main_class.items()):
+            writer.writerow([
+                main_class_id,
+                stats["tp"],
+                stats["fp"],
+                stats["fn"],
+                f"{stats['precision']:.4f}",
+                f"{stats['recall']:.4f}",
+                f"{stats['f1']:.4f}",
+            ])
+
+
 def print_human_summary(result: EvaluationResult) -> None:
     s = result.summary
-    fl = s["finding_level"]
-    fl_l = s.get("finding_level_lenient", {})
-    seg = s["segment_level_detection"]
+    fl = s["finding_level_span_only"]
+
+    total_gold = s.get("gold_findings", fl["tp"] + fl["fn"])
+    total_pred = s.get("pred_findings", fl["tp"] + fl["fp"])
 
     print("=" * 90)
-    print("EVALUATION SUMMARY")
+    print("EVALUATION SUMMARY — Span-Only Matching (case-level, kein Segment-Index-Match)")
     print("=" * 90)
-    print("Finding level — STRICT (exact subclass + span)")
-    print(f"  TP: {fl['tp']}")
-    print(f"  FP: {fl['fp']}")
-    print(f"  FN: {fl['fn']}")
-    print(f"  Precision: {fl['precision']:.4f}")
-    print(f"  Recall:    {fl['recall']:.4f}")
-    print(f"  F1:        {fl['f1']:.4f}")
+    print(f"  Gold Findings (GT):  {total_gold}")
+    print(f"  Pred Findings:       {total_pred}")
+    print(f"  Span-Schwellwert:    {s['min_span_score']:.2f}")
     print("")
-    fl_d = s.get("finding_level_document", {})
-    if fl_d:
-        print("Finding level — DOCUMENT (no segment boundary, main class + span)")
-        print(f"  TP: {fl_d.get('tp', 0)}")
-        print(f"  FP: {fl_d.get('fp', 0)}")
-        print(f"  FN: {fl_d.get('fn', 0)}")
-        print(f"  Precision: {fl_d.get('precision', 0):.4f}")
-        print(f"  Recall:    {fl_d.get('recall', 0):.4f}")
-        print(f"  F1:        {fl_d.get('f1', 0):.4f}")
-        print("")
-    if fl_l:
-        print("Finding level — LENIENT (main class + span, subclass not required)")
-        print(f"  TP: {fl_l.get('tp', 0)}")
-        print(f"  FP: {fl_l.get('fp', 0)}")
-        print(f"  FN: {fl_l.get('fn', 0)}")
-        print(f"  Precision: {fl_l.get('precision', 0):.4f}")
-        print(f"  Recall:    {fl_l.get('recall', 0):.4f}")
-        print(f"  F1:        {fl_l.get('f1', 0):.4f}")
-        print("")
-    print("Segment level detection")
-    print(f"  TP: {seg['tp']}")
-    print(f"  FP: {seg['fp']}")
-    print(f"  FN: {seg['fn']}")
-    print(f"  Precision: {seg['precision']:.4f}")
-    print(f"  Recall:    {seg['recall']:.4f}")
-    print(f"  F1:        {seg['f1']:.4f}")
+    print(f"  TP (korrekt erkannt):      {fl['tp']}")
+    print(f"  FP (False Positives):      {fl['fp']}")
+    print(f"  FN (nicht erkannt):        {fl['fn']}")
+    print(f"  Precision:                 {fl['precision']:.4f}")
+    print(f"  Recall:                    {fl['recall']:.4f}")
+    print(f"  F1:                        {fl['f1']:.4f}")
     print("")
-    print(f"Matched pairs: {s['matched_pairs']}")
-    print(f"Change type accuracy on matched: {s['change_type_accuracy_on_matched']:.4f}")
-    print(f"Severity accuracy on matched:    {s['severity_accuracy_on_matched']:.4f}")
-    print(f"Correction accuracy considered:  {s['correction_accuracy_on_considered']:.4f}")
-    print(f"Correction cases considered:     {s['correction_considered']}")
-    print(f"Span threshold:                  {s['min_span_score']:.2f}")
+    print(f"  Matched pairs:             {s['matched_pairs']}")
+    print(f"  Subclass-Genauigkeit:      {s['subclass_accuracy_on_matched']:.4f}  (auf gematchten Paaren)")
+    print(f"  Change-type-Genauigkeit:   {s['change_type_accuracy_on_matched']:.4f}  (auf gematchten Paaren)")
+    print(f"  Severity-Genauigkeit:      {s['severity_accuracy_on_matched']:.4f}  (auf gematchten Paaren)")
+    print(f"  Korrektur-Genauigkeit:     {s['correction_accuracy_on_considered']:.4f}  ({s['correction_considered']} Fälle)")
+    print("")
+
+    # Per-Subklasse
+    per_sub = result.per_subclass
+    if per_sub:
+        print("─" * 90)
+        print(f"  {'Subklasse':<40} {'TP':>4} {'FP':>4} {'FN':>4}  {'Prec':>7} {'Rec':>7} {'F1':>7}")
+        print("─" * 90)
+        for subclass_id in sorted(per_sub):
+            st = per_sub[subclass_id]
+            print(
+                f"  {subclass_id:<40} {st['tp']:>4} {st['fp']:>4} {st['fn']:>4} "
+                f" {st['precision']:>7.4f} {st['recall']:>7.4f} {st['f1']:>7.4f}"
+            )
+        print("")
+
+    # Per-Hauptklasse
+    per_main = result.per_main_class
+    if per_main:
+        print("─" * 90)
+        print(f"  {'Hauptklasse':<20} {'TP':>4} {'FP':>4} {'FN':>4}  {'Prec':>7} {'Rec':>7} {'F1':>7}")
+        print("─" * 90)
+        for main_id in sorted(per_main):
+            mt = per_main[main_id]
+            print(
+                f"  {main_id:<20} {mt['tp']:>4} {mt['fp']:>4} {mt['fn']:>4} "
+                f" {mt['precision']:>7.4f} {mt['recall']:>7.4f} {mt['f1']:>7.4f}"
+            )
+        print("")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -809,13 +1168,13 @@ def parse_args() -> argparse.Namespace:
         "--min_span_score",
         type=float,
         default=0.60,
-        help="Minimum fuzzy span score for matching within a segment (default: 0.60)",
+        help="Minimum fuzzy span score for span_text-only matching within a case (default: 0.60)",
     )
     ap.add_argument(
         "--require_exact_subclass",
         action="store_true",
         default=False,
-        help="Strict mode: require exact subclass_id match (default: False — main class sufficient)",
+        help="Deprecated/ignored: matching is always span_text-only now",
     )
     ap.add_argument(
         "--output_dir",
@@ -854,11 +1213,15 @@ def main() -> None:
 
     write_json(out_dir / "summary.json", result.summary)
     write_json(out_dir / "per_subclass.json", result.per_subclass)
+    write_json(out_dir / "per_main_class.json", result.per_main_class)
     write_json(out_dir / "confusion.json", result.confusion)
     write_jsonl(out_dir / "matches.jsonl", result.matches)
+    write_jsonl(out_dir / "matches_document_strict.jsonl", result.document_strict_matches)
+    write_jsonl(out_dir / "matches_document_lenient.jsonl", result.document_lenient_matches)
     write_jsonl(out_dir / "false_negatives.jsonl", result.false_negatives)
     write_jsonl(out_dir / "false_positives.jsonl", result.false_positives)
     write_per_subclass_csv(out_dir / "per_subclass.csv", result.per_subclass)
+    write_per_main_class_csv(out_dir / "per_main_class.csv", result.per_main_class)
 
     print("")
     print(f"[INFO] Wrote evaluation artifacts to: {out_dir}")

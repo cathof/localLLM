@@ -125,6 +125,28 @@
           "description": "falsche oder fehlende Anrede"
         }
       ]
+    },
+    {
+      "id": "RECHENFEHLER",
+      "label": "Rechenfehler",
+      "subclasses": [
+        {
+          "id": "RECHEN_ARITHMETIK",
+          "label": "Arithmetischer Fehler",
+          "description": "Falsches Rechenergebnis durch Rechen- oder Umrechnungsfehler"
+        }
+      ]
+    },
+    {
+      "id": "HYPOTHESEN",
+      "label": "Hypothesenprüfung",
+      "subclasses": [
+        {
+          "id": "HYPO_INKONSISTENZ",
+          "label": "Inkonsistente Hypothesenbewertung",
+          "description": "Gleiche Befunde führen zu widersprüchlichen Schlussfolgerungen bei verschiedenen Hypothesen oder Befundbewertung widerspricht der zugehörigen Hypothese direkt"
+        }
+      ]
     }
   ],
   "change_types": [
@@ -157,6 +179,16 @@
       "id": "CHANGE_NORMATIV",
       "label": "Normativer Mangel",
       "description": "Verstoss gegen QM/QS-Vorgaben"
+    },
+    {
+      "id": "CHANGE_RECHNERISCH",
+      "label": "Rechnerische Korrektur",
+      "description": "Korrektur eines falschen Zahlenwerts oder einer Berechnung"
+    },
+    {
+      "id": "CHANGE_HYPOTHESE",
+      "label": "Hypothesen-Korrektur",
+      "description": "Korrektur einer Inkonsistenz zwischen Hypothese und Befundbewertung"
     }
   ],
   "severity_levels": [
