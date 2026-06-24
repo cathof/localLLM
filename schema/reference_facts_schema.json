@@ -1,0 +1,158 @@
+{
+  "type": "object",
+  "properties": {
+    "case_id": {
+      "type": "string"
+    },
+    "facts": {
+      "type": "object",
+      "properties": {
+        "auftraggeber": {
+          "$ref": "#/$defs/fact"
+        },
+        "gutachten_titel": {
+          "$ref": "#/$defs/fact"
+        },
+        "vorfall": {
+          "$ref": "#/$defs/fact"
+        },
+        "ereignisdatum": {
+          "$ref": "#/$defs/fact"
+        },
+        "beschuldigte_person": {
+          "$ref": "#/$defs/fact"
+        },
+        "ort": {
+          "$ref": "#/$defs/fact"
+        },
+        "sachverstaendige_person": {
+          "$ref": "#/$defs/fact"
+        },
+        "hauptsachbearbeitung": {
+          "$ref": "#/$defs/fact"
+        },
+        "personen": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/person"
+          }
+        },
+        "referenz_entitaeten": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/referenz_entitaet"
+          }
+        }
+      },
+      "required": [
+        "auftraggeber",
+        "gutachten_titel",
+        "vorfall",
+        "ereignisdatum",
+        "beschuldigte_person",
+        "ort",
+        "sachverstaendige_person",
+        "hauptsachbearbeitung",
+        "personen",
+        "referenz_entitaeten"
+      ]
+    }
+  },
+  "required": [
+    "case_id",
+    "facts"
+  ],
+  "$defs": {
+    "fact": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "source_span": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "source_span",
+        "confidence"
+      ]
+    },
+    "person": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "rolle": {
+          "type": "string"
+        },
+        "source_span": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "rolle",
+        "source_span",
+        "confidence"
+      ]
+    },
+    "referenz_entitaet": {
+      "type": "object",
+      "properties": {
+        "bezeichnung": {
+          "type": "string"
+        },
+        "typ": {
+          "type": "string"
+        },
+        "rolle": {
+          "type": "string"
+        },
+        "source_span": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "bezeichnung",
+        "typ",
+        "rolle",
+        "source_span",
+        "confidence",
+        "aliases"
+      ]
+    }
+  }
+}

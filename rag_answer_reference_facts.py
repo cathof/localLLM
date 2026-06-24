@@ -5,12 +5,13 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import requests
@@ -32,6 +33,108 @@ def load_dotenv(dotenv_path: str | Path = ".env") -> None:
 
 
 load_dotenv(".env")
+
+
+# ── Run logger (tee stdout+stderr to logs/) ───────────────────────────────────
+
+class _TeeLogger:
+    """Writes every write() call to both the original stream and a log file."""
+
+    def __init__(self, original_stream, log_file_handle):
+        self._orig = original_stream
+        self._log  = log_file_handle
+
+    def write(self, msg: str) -> int:
+        self._orig.write(msg)
+        self._orig.flush()
+        self._log.write(msg)
+        self._log.flush()
+        return len(msg)
+
+    def flush(self) -> None:
+        self._orig.flush()
+        self._log.flush()
+
+    # Delegate everything else (e.g. .fileno(), .isatty()) to the original.
+    def __getattr__(self, name: str):
+        return getattr(self._orig, name)
+
+
+def _setup_run_logging(case_id: str, model_name: str) -> Optional[Path]:
+    """
+    Creates logs/<YYYY-MM-DD_HH-MM-SS>_<case_id>_<model_tag>.log and tees
+    sys.stdout + sys.stderr into it.  Returns the log path (or None on error).
+
+    Called once at the start of main() after args are parsed.
+    """
+    try:
+        logs_dir = Path("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        ts       = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        case_tag = (case_id or "nocase").strip().replace(" ", "_")
+        model_tag = re.sub(r"[^A-Za-z0-9._-]", "-", model_name or "unknown")
+        log_name  = f"{ts}_{case_tag}_{model_tag}.log"
+        log_path  = logs_dir / log_name
+
+        log_fh = log_path.open("w", encoding="utf-8", buffering=1)
+
+        sys.stdout = _TeeLogger(sys.__stdout__, log_fh)
+        sys.stderr = _TeeLogger(sys.__stderr__, log_fh)
+
+        # Write header so the file is self-contained
+        header = (
+            f"# RAG run log\n"
+            f"# Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# Case    : {case_id or '(none)'}\n"
+            f"# Model   : {model_name or '(unknown)'}\n"
+            f"# Log file: {log_path.resolve()}\n"
+            f"{'#' * 72}\n\n"
+        )
+        sys.stdout.write(header)
+
+        return log_path
+
+    except Exception as exc:  # never crash the pipeline over logging
+        sys.__stdout__.write(f"[WARN] Could not set up log file: {exc}\n")
+        return None
+
+
+def _teardown_run_logging(log_path: Optional[Path]) -> None:
+    """Flushes and closes the log file; restores sys.stdout/stderr.
+    stdout and stderr share the SAME underlying file handle, so it must be
+    closed exactly once — and the std streams must be restored FIRST, so that
+    a failure here can never leave a broken _TeeLogger on sys.stderr (which
+    would crash the interpreter's shutdown flush with exit code 120).
+    """
+    try:
+        log_fh = None
+
+        # Restore the real streams first; remember the shared handle.
+        if isinstance(sys.stdout, _TeeLogger):
+            log_fh = sys.stdout._log
+            sys.stdout = sys.__stdout__
+        if isinstance(sys.stderr, _TeeLogger):
+            log_fh = sys.stderr._log
+            sys.stderr = sys.__stderr__
+
+        # Close the shared handle exactly once.
+        if log_fh is not None and not log_fh.closed:
+            try:
+                log_fh.flush()
+            except Exception:
+                pass
+            log_fh.close()
+
+        if log_path is not None:
+            print(f"[INFO] Log written to: {log_path}")
+    except Exception as exc:
+        # Make sure the real streams are restored even on an unexpected error.
+        if isinstance(sys.stdout, _TeeLogger):
+            sys.stdout = sys.__stdout__
+        if isinstance(sys.stderr, _TeeLogger):
+            sys.stderr = sys.__stderr__
+        sys.__stdout__.write(f"[WARN] Could not close log file: {exc}\n")
 
 
 def env_str(key: str, default: str) -> str:
@@ -593,48 +696,37 @@ def build_reference_facts_messages(
         case_id: str,
         document_header: str = "",
 ) -> List[Dict[str, str]]:
+    # System: kurz, nur Output-Format und allgemeine Extraktionsregeln.
+    # Feldbezogene Semantik steht im User-Prompt direkt bei den Feldern.
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem JSON-Objekt. "
-        "Kein Markdown, keine Erklärung.\n\n"
+        "Antworte AUSSCHLIESSLICH mit einem JSON-Objekt. Kein Markdown, keine Erklärung.\n\n"
         "Du bist Agent 0: Referenzfakten-Extraktor für forensische Gutachten.\n"
-        "Extrahiere nur explizit im DOKUMENTKONTEXT belegte Fakten. "
-        "Erfinde nichts. Wenn ein Feld nicht eindeutig im Kontext steht, setze value und source_span auf \"\" "
-        "und confidence auf \"low\".\n\n"
-        "Regeln:\n"
-        "- value = normalisierter Wert.\n"
-        "- source_span = exakter kurzer Ausschnitt aus dem Dokumentkontext, der den Wert belegt.\n"
-        "- confidence = high, wenn der Wert explizit und eindeutig im Kopf/Titel steht; "
-        "medium, wenn er plausibel aber nicht ganz eindeutig ist; low, wenn er fehlt/unsicher ist.\n"
-        "- Für auftraggeber gilt: Extrahiere die adressierte Behörde oder Institution aus dem "
-        "Dokumentkopf, Briefkopf oder Adressfeld am Anfang des Dokuments.\n"
-        "- Wenn im Dokumentkopf eine Behörde mit Adresse steht, hat diese für auftraggeber Vorrang.\n"
-        "- Verwende für auftraggeber NICHT einen späteren Fliesstextsatz wie "
-        "'Mit Schreiben ... erteilte ... den Auftrag', wenn eine Kopf-/Adresszeile vorhanden ist.\n"
-        "- Personen wie Jugendanwältin, Staatsanwältin, RA, RAin oder sachverständige Person sind "
-        "nicht allein der Auftraggeber; der Auftraggeber ist die Institution oder Behörde.\n"
-        "- ereignisdatum ist das Datum des eigentlichen Vorfalls/Ereignisses/Unfalls, nicht das Berichtsdatum, "
-        "Auftragsdatum, Eingangsdatum oder Versanddatum. Extrahiere es nur, wenn es im Dokumentkontext explizit "
-        "als Vorfall-, Ereignis-, Unfall- oder Tatdatum erkennbar ist.\n"
-        "- Wenn mehrere Datumsangaben vorkommen, wähle für ereignisdatum das Datum, das semantisch zum Vorfall gehört. "
-        "Bei Unsicherheit setze confidence auf low.\n"
-        "- Wenn möglich, schreibe ereignisdatum.value im ISO-Format YYYY-MM-DD; source_span bleibt der exakte Originalausschnitt.\n"
-        "- Wenn im Dokumentkopf ein Tabellen-/Feldtitel 'Person' vorkommt, ist damit die "
-        "beschuldigte Person des Falls gemeint. Extrahiere diesen Wert zusätzlich in "
-        "beschuldigte_person. Beispiel: 'Person GERBER Joel, 16.09.2006 Beschuldigt "
-        "als Lenker ...' → beschuldigte_person.value = 'Joel GERBER, 16.09.2006, "
-        "Beschuldigte Person, als Lenker ...'.\n"
-        "- personen ist eine Liste aller im Dokumentkopf/Anfangskontext genannten relevanten Personen "
-        "mit Rolle, falls erkennbar.\n"
-        "- Nutze exakt die vorgegebenen Feldnamen."
+        "Extrahiere nur Fakten die explizit im DOKUMENTKONTEXT stehen. Erfinde nichts.\n\n"
+        "Für jedes Feld gilt:\n"
+        "- value: normalisierter Wert (Datum wenn möglich als YYYY-MM-DD)\n"
+        "- source_span: exakter kurzer Ausschnitt aus dem Kontext der den Wert belegt\n"
+        "- confidence: high = explizit/eindeutig | medium = plausibel/indirekt | low = fehlt/unsicher\n"
+        "Fehlendes Feld: value=\"\", source_span=\"\", confidence=\"low\".\n"
+        "Nutze exakt die vorgegebenen Feldnamen."
     )
 
+    # User: Dokumentkontext + feldbezogene Extraktionsregeln direkt bei den Feldern.
     user = (
         f"CASE_ID:\n{case_id}\n\n"
-        f"DOKUMENTKOPF / ADRESSIERUNG — für auftraggeber vorrangig verwenden:\n"
+        f"DOKUMENTKOPF / ADRESSIERUNG:\n"
         f"{document_header.strip()}\n\n"
         f"DOKUMENTKONTEXT:\n{doc_context.strip()}\n\n"
-        "Für das Feld auftraggeber zuerst den Dokumentkopf / die Adressierung am Anfang prüfen.\n"
-        "Bei Konflikt zwischen Adressierung und späterem Fliesstext hat die Adressierung Vorrang.\n\n"
+        "FELDREGELN — lies diese vor der Extraktion:\n"
+        "- auftraggeber: Behörde oder Institution aus dem Dokumentkopf/Briefkopf/Adressfeld.\n"
+        "  Vorrang hat die Adressierung am Anfang vor späterem Fliesstext ('Mit Schreiben...').\n"
+        "  Personen (Jugendanwältin, RA, Sachverständige) sind nicht der Auftraggeber.\n"
+        "- ereignisdatum: Datum des Vorfalls/Unfalls/Ereignisses — nicht Berichts-, Auftrags-\n"
+        "  oder Versanddatum. Nur extrahieren wenn explizit als Vorfall-/Tatdatum erkennbar.\n"
+        "  Bei mehreren Daten: dasjenige wählen das semantisch zum Vorfall gehört.\n"
+        "- beschuldigte_person: Wenn im Kopf ein Tabellenfeld 'Person' steht, ist dies die\n"
+        "  beschuldigte Person. Beispiel: 'Person GERBER Joel, 16.09.2006 Beschuldigt als Lenker'\n"
+        "  → value = 'Joel GERBER, 16.09.2006, Beschuldigte Person, als Lenker'.\n"
+        "- personen: Liste aller im Dokumentkopf genannten relevanten Personen mit Rolle.\n\n"
         "Gib exakt dieses JSON-Objekt zurück:\n"
         "{\n"
         "  \"case_id\": \"...\",\n"
@@ -1192,11 +1284,13 @@ def retrieve_multi_query(
         mmr_lambda: float,
         max_per_source: int,
         mode: str,
+        query_expander: Optional[Callable[..., List[str]]] = None,
         case_id: str = "",
         rules_top_k: int = 10,
         material_top_k: int = 10,
 ) -> Tuple[List[Retrieved], List[str], List[Retrieved], List[Retrieved]]:
-    queries = build_multi_queries(query_text, mode=mode, max_queries=multi_query_count)
+    expand = query_expander or build_multi_queries
+    queries = expand(query_text, mode=mode, max_queries=multi_query_count)
 
     rules_candidates: List[Retrieved] = []
     material_candidates: List[Retrieved] = []
@@ -1474,11 +1568,28 @@ class OllamaClient(LLMClient):
             model: str,
             options: Dict[str, Any],
             timeout_s: int,
+            disable_think: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.options = options
         self.timeout_s = timeout_s
+        # Reasoning models (e.g. Qwen3) otherwise spend their whole generation
+        # budget inside the <think> block and return empty message.content,
+        # which silently degrades structured agents (Agent 0, factual agent) to
+        # empty results. When True we send "think": false on every call.
+        self.disable_think = disable_think
+
+    def _post_chat(self, payload: Dict[str, Any]) -> str:
+        """Single /api/chat round-trip. Returns the stripped message content."""
+        url = f"{self.base_url}/api/chat"
+        r = requests.post(url, json=payload, timeout=self.timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        content = (data.get("message") or {}).get("content")
+        if not isinstance(content, str):
+            raise RuntimeError(f"Unexpected Ollama response: {data}")
+        return content.strip()
 
     def chat(
             self,
@@ -1486,7 +1597,6 @@ class OllamaClient(LLMClient):
             json_mode: bool = False,
             schema: Optional[Dict[str, Any]] = None,
     ) -> str:
-        url = f"{self.base_url}/api/chat"
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -1502,13 +1612,35 @@ class OllamaClient(LLMClient):
         elif json_mode:
             payload["format"] = "json"
 
-        r = requests.post(url, json=payload, timeout=self.timeout_s)
-        r.raise_for_status()
-        data = r.json()
-        content = (data.get("message") or {}).get("content")
-        if not isinstance(content, str):
-            raise RuntimeError(f"Unexpected Ollama response: {data}")
-        return content.strip()
+        if self.disable_think:
+            payload["think"] = False
+
+        try:
+            content = self._post_chat(payload)
+        except requests.HTTPError as exc:
+            # Older Ollama versions / non-thinking models reject the `think`
+            # field with a 400. Drop it and retry once instead of crashing.
+            body = ""
+            try:
+                body = exc.response.text if exc.response is not None else ""
+            except Exception:
+                body = ""
+            if payload.get("think") is False and "think" in body.lower():
+                payload.pop("think", None)
+                content = self._post_chat(payload)
+            else:
+                raise
+
+        # If thinking was left enabled and the model returned nothing (budget
+        # exhausted mid-<think>), retry once with thinking explicitly off.
+        if not content and payload.get("think") is not False:
+            payload["think"] = False
+            try:
+                content = self._post_chat(payload)
+            except requests.HTTPError:
+                pass
+
+        return content
 
 
 def make_llm_client() -> LLMClient:
@@ -1524,12 +1656,121 @@ def make_llm_client() -> LLMClient:
             model=model,
             options=options,
             timeout_s=timeout_s,
+            disable_think=env_bool("LLM_DISABLE_THINK", True),
         )
 
     raise RuntimeError(f"Unsupported LLM_BACKEND: {backend!r}")
 
 
+# ── Query expansion (Stufe B: LLM-basiertes Query-Rewriting) ──────────────────
+
+QueryExpander = Callable[..., List[str]]
+
+
+class LLMQueryExpander:
+    """Semantisches Query-Rewriting über ein FEST gewähltes Modell.
+
+    Läuft bewusst NICHT mit dem evaluierten Modell, damit das Retrieval
+    über alle verglichenen Modelle identisch bleibt. Ergebnisse werden
+    gecached; bei Fehlern wird auf die deterministische Heuristik
+    build_multi_queries zurückgefallen, damit die Pipeline nie abbricht.
+    """
+
+    _SCHEMA = {
+        "type": "object",
+        "properties": {
+            "queries": {"type": "array", "items": {"type": "string"},
+                        "minItems": 1, "maxItems": 6},
+        },
+        "required": ["queries"],
+    }
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+        self._cache: Dict[str, List[str]] = {}
+
+    def __call__(self, query_text: str, *, mode: str, max_queries: int) -> List[str]:
+        base = _normalize_query_text(query_text)
+        if not base:
+            return []
+        cache_key = f"{max_queries}|{base.lower()}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n_rewrites = max(1, max_queries - 1)  # Original kommt zusätzlich dazu
+        messages = [
+            {"role": "system", "content": (
+                "Du formulierst Suchanfragen für ein deutschsprachiges Retrieval-System um. "
+                "Erzeuge semantisch VERSCHIEDENE Umformulierungen derselben Informationsabsicht: "
+                "Synonyme, andere Satzstellung, Ober- und Unterbegriffe. "
+                "Hänge KEINE blossen Stichwörter an. Erfinde keine neuen Fakten. "
+                "Antworte ausschliesslich mit einem JSON-Objekt der Form {\"queries\": [...]}."
+            )},
+            {"role": "user", "content":
+                f"Anfrage:\n{base}\n\nErzeuge genau {n_rewrites} alternative Umformulierungen."},
+        ]
+        try:
+            raw = self.llm.chat(messages, json_mode=True, schema=self._SCHEMA)
+            rewrites = [
+                _normalize_query_text(q)
+                for q in json.loads(raw).get("queries", [])
+                if isinstance(q, str)
+            ]
+        except Exception as exc:
+            print(f"[QUERY-EXPAND] LLM-Rewriting fehlgeschlagen, Fallback auf Heuristik: {exc}")
+            fallback = build_multi_queries(base, mode=mode, max_queries=max_queries)
+            self._cache[cache_key] = fallback
+            return fallback
+
+        out: List[str] = []
+        seen: Set[str] = set()
+        for q in [base, *rewrites]:
+            key = q.lower()
+            if q and key not in seen:
+                seen.add(key)
+                out.append(q)
+            if len(out) >= max_queries:
+                break
+
+        if not out:  # Modell lieferte nur Unbrauchbares
+            out = build_multi_queries(base, mode=mode, max_queries=max_queries)
+        self._cache[cache_key] = out
+        return out
+
+
+def make_query_expander() -> Optional[QueryExpander]:
+    """Baut den Query-Expander. Bei QUERY_EXPANDER_MODE != 'llm' wird None
+    zurückgegeben, wodurch retrieve_multi_query auf die deterministische
+    Heuristik build_multi_queries zurückfällt."""
+    mode = env_str("QUERY_EXPANDER_MODE", "heuristic").lower()
+    if mode != "llm":
+        return None
+
+    if require_env("LLM_BACKEND").lower() != "ollama":
+        raise RuntimeError("Query-Expander unterstützt derzeit nur ollama.")
+
+    model = require_env("QUERY_EXPANDER_MODEL")  # FEST – nicht das evaluierte Modell!
+    client = OllamaClient(
+        base_url=require_env("OLLAMA_BASE_URL"),
+        model=model,
+        options=env_json_object_optional("QUERY_EXPANDER_OPTIONS_JSON") or {"temperature": 0.0},
+        timeout_s=env_int("LLM_TIMEOUT_S", 300),
+        disable_think=env_bool("LLM_DISABLE_THINK", True),
+    )
+    print(f"[INFO] Query-Expander: LLM-Modus, festes Modell={model!r}")
+    return LLMQueryExpander(client)
+
+
 # ── Prompt builders ───────────────────────────────────────────────────────────
+
+# Gemeinsame System-Prompt-Präambel für alle Agenten (2–7).
+_AGENT_JSON_PREFIX = (
+    "Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
+    "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
+    "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
+)
+
 
 def build_qa_messages(question: str, context: str) -> List[Dict[str, str]]:
     system = (
@@ -1568,72 +1809,69 @@ def build_factual_review_messages(
     ))
 
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem JSON-Objekt. "
-        "Erste Zeichen müssen '{\"errors\"' sein. Kein Text, kein Markdown.\n\n"
+            _AGENT_JSON_PREFIX +
 
-        "Du bist Agent 2: Fachprüfer für technische Dokumente.\n"
-        "Erkenne Fehler im DOKUMENTSEGMENT und belege sie mit REGELWERK- oder FALLMATERIAL-QUELLEN.\n"
-        "Für Logikfehler innerhalb des aktuellen Segments: source_refs=[\"DOC_INTERNAL\"].\n\n"
+            "Du bist Agent 2: Fachprüfer für technische Dokumente.\n"
+            "Erkenne Fehler im DOKUMENTSEGMENT und belege sie mit REGELWERK- oder FALLMATERIAL-QUELLEN.\n"
+            "Für Logikfehler innerhalb des aktuellen Segments: source_refs=[\"DOC_INTERNAL\"].\n\n"
 
-        "Zusätzliche interne Evidenzregel:\n"
-        "Unspezifische Quellenangaben wie 'aus unseren Quellen', 'gemäss Aktenlage', "
-        "'laut Unterlagen', 'es ist bekannt' oder 'nach unseren Informationen' sind zu melden, "
-        "wenn keine konkrete Quelle, Aktenstelle, Beilage oder Dokumentreferenz genannt wird.\n"
-        "Klassifikation: Struktur und Argumentation > Evidenz / Belege; "
-        "aenderungstyp = Evidenzergänzung; source_refs=[\"DOC_INTERNAL\"].\n\n"
+            "Interne Evidenzregel (STRUKT_EVIDENZ):\n"
+            "Melde eine fehlende Quellenangabe NUR wenn BEIDE Bedingungen erfüllt sind:\n"
+            "  1. Der Satz macht eine konkrete Tatsachenbehauptung (Messwert, Befund, Identifikation)\n"
+            "  2. Es fehlt jede Quellenreferenz: weder Aktenstelle, Beilage, Dokumentverweis\n"
+            "     noch eine Quellenformel ('gemäss Aktenlage', 'laut Unterlagen', 'gemäss Quellen',\n"
+            "     'laut Gutachten LSI', 'gemäss FOR', 'gemäss Quellenmaterial').\n"
+            "NICHT melden als STRUKT_EVIDENZ: Sätze mit irgendeiner Quellenformel — auch wenn sie\n"
+            "unspezifisch ist. NICHT auf STRUKT_BEFUND_BESCHREIBUNG ausweichen wenn die Quellenangabe\n"
+            "fehlt — dafür gibt es ausschliesslich STRUKT_EVIDENZ.\n"
+            "Klassifikation: subklasse='Evidenz / Belege'; "
+            "aenderungstyp='Evidenzergänzung'; source_refs=[\"DOC_INTERNAL\"].\n\n"
 
-        "PFLICHTFELDER:\n"
-        f"  hauptklasse       {hauptklassen}\n"
-        "  subklasse         passende Subklasse zur Hauptklasse\n"
-        f"  aenderungstyp     {aenderungstypen}\n"
-        "  schweregrad       niedrig | mittel | hoch\n"
-        "  stelle_im_segment kurzer Originalausschnitt max. 8 Wörter NUR aus dem SEGMENT\n"
-        "  begruendung       'Laut [SRC_X_N]: ...' oder 'Widerspruch: ...' bei DOC_INTERNAL\n"
-        "  source_refs       mind. eine Ref — sonst kein Finding erlaubt\n\n"
+            "PFLICHTFELDER:\n"
+            f"  hauptklasse       {hauptklassen}\n"
+            "  subklasse         passende Subklasse zur Hauptklasse\n"
+            f"  aenderungstyp     {aenderungstypen}\n"
+            "  schweregrad       niedrig | mittel | hoch\n"
+            "  stelle_im_segment kurzer Originalausschnitt max. 8 Wörter NUR aus dem SEGMENT\n"
+            "  begruendung       'Laut [SRC_X_N]: ...' oder 'Widerspruch: ...' bei DOC_INTERNAL\n"
+            "  source_refs       mind. eine Ref — sonst kein Finding erlaubt\n\n"
 
+            "NICHT melden:\n"
+            "  ss-Schreibweise (Schweiz korrekt) | sprachliche/stilistische Fehler (Agent 3) | "
+            "Rechenfehler (Agent 4) | Hypothesenfehler (Agent 5) | "
+            "Fehler die im Segment selbst erklärt werden\n\n"
 
-        "NICHT melden:\n"
-        "  ss-Schreibweise (Schweiz korrekt) | sprachliche/stilistische Fehler (Agent 3) | "
-        "Rechenfehler (Agent 4) | Hypothesenfehler (Agent 5) | "
-        "Fehler die im Segment selbst erklärt werden\n\n"
+            "Kein belegbarer Fehler → {\"errors\":[]}\n\n"
 
-        "Kein belegbarer Fehler → {\"errors\":[]}\n\n"
+            "Beispiel externe Quelle:\n"
+            "{\"errors\":[{\"hauptklasse\":\"Struktur und Argumentation\","
+            "\"subklasse\":\"Beschreibung von Befunden\","
+            "\"aenderungstyp\":\"Fachliche Präzisierung\","
+            "\"schweregrad\":\"hoch\","
+            "\"stelle_im_segment\":\"<Originalausschnitt mit Fehler>\","
+            "\"begruendung\":\"Laut [SRC_X_N]: <abweichender Wert aus Quelle>.\","
+            "\"source_refs\":[\"SRC_X_N\"]}]}\n\n"
 
-        "Beispiel externe Quelle:\n"
-        "{\"errors\":[{\"hauptklasse\":\"Struktur und Argumentation\","
-        "\"subklasse\":\"Beschreibung von Befunden\","
-        "\"aenderungstyp\":\"Fachliche Präzisierung\","
-        "\"schweregrad\":\"hoch\","
-        "\"stelle_im_segment\":\"Joel Wacker\","
-        "\"begruendung\":\"Laut [S9_M_1]: Fahrzeuglenker ist Joel GERBER, nicht Joel Wacker.\","
-        "\"source_refs\":[\"S9_M_1\"]}]}\n\n"
-
-        "Beispiel interner Widerspruch:\n"
-        "{\"errors\":[{\"hauptklasse\":\"Struktur und Argumentation\","
-        "\"subklasse\":\"Beschreibung von Befunden\","
-        "\"aenderungstyp\":\"Fachliche Präzisierung\","
-        "\"schweregrad\":\"hoch\","
-        "\"stelle_im_segment\":\"nicht mehr sichtbar\","
-        "\"begruendung\":\"Widerspruch: Segment nennt gute Sichtverhältnisse, Negation ist falsch.\","
-        "\"source_refs\":[\"DOC_INTERNAL\"]}]}"
+            "Beispiel interner Widerspruch:\n"
+            "{\"errors\":[{\"hauptklasse\":\"Struktur und Argumentation\","
+            "\"subklasse\":\"Beschreibung von Befunden\","
+            "\"aenderungstyp\":\"Fachliche Präzisierung\","
+            "\"schweregrad\":\"hoch\","
+            "\"stelle_im_segment\":\"<Originalausschnitt mit Widerspruch>\","
+            "\"begruendung\":\"Widerspruch: <Erklärung des internen Widerspruchs>.\","
+            "\"source_refs\":[\"DOC_INTERNAL\"]}]}"
     )
 
     user = (
         f"DOKUMENTSEGMENT:\n{segment_text.strip()}\n\n"
         f"REGELWERK-QUELLEN:\n{rules_context.strip()}\n\n"
-        f"FALLMATERIAL-QUELLEN:\n{material_context.strip()}\n\n"
-        "Analysiere SCHRITT FÜR SCHRITT:\n"
-        "1. Welche Personen, Institutionen, Fahrzeugtypen, Orte stehen im SEGMENT?\n"
-        "   → Vergleiche jeden Begriff mit den FALLMATERIAL-QUELLEN. Abweichung = Fehler.\n"
-        "2. Welche numerischen Werte (Gewichte, Distanzen, Zeiten) stehen im SEGMENT?\n"
-        "   → Vergleiche mit den FALLMATERIAL-QUELLEN. Abweichung = Fehler.\n"
-        "3. Sind Befundbeschreibungen konsistent mit dem Bildmaterial in den FALLMATERIAL-QUELLEN?\n"
-        "4. Werden Fachbegriffe aus den REGELWERK-QUELLEN korrekt angewendet?\n"
-        "5. Gibt es logische Widersprüche innerhalb des SEGMENTS?\n"
-        "→ Melde alle Abweichungen die durch Quellen belegbar sind. "
-        "Melde NUR echte Fehler — Abweichungen zwischen SEGMENT und Quellen. "
-        "Wenn das SEGMENT korrekt ist und mit den Quellen übereinstimmt, "
-        "gib KEIN Finding aus. Bestätigungen sind verboten.\n"
+        "Prüfe NUR dokumentinterne Fehler und Regelwerk-Verletzungen:\n"
+        "1. Gibt es logische Widersprüche innerhalb des SEGMENTS selbst?\n"
+        "2. Werden Fachbegriffe aus dem REGELWERK falsch angewendet?\n"
+        "3. Ist eine konkrete Tatsachenbehauptung ohne jede Quellenangabe belassen?\n"
+        "source_refs = [\"DOC_INTERNAL\"] für STRUKT_EVIDENZ (fehlende Quellenangabe).\n"
+        "Für Regelwerk-Fehler: echte Chunk-ID aus den QUELLEN (z.B. S7_R_3), niemals SRC_X_N.\n"
+        "Kein Fehler gefunden → {\"errors\":[]}\n"
         "Antworte NUR mit dem JSON-Objekt."
     )
 
@@ -1646,45 +1884,44 @@ def build_factual_review_messages(
 
 def build_language_review_messages(segment_text: str) -> List[Dict[str, str]]:
     system = (
-        "WICHTIG: Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
-        "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
-        "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
-        "Du bist Agent 3: Sprach- und Formalprüfer.\n"
-        "Du meldest NUR eindeutige, lokale formale Fehler.\n\n"
-        "Zulässige Taxonomie für die Ausgabe:\n"
-        "  hauptklasse = Formales\n"
-        "  subklasse = Redaktionelle Korrektur ODER Referenzen (formal) ODER Dokumentstruktur ODER Adressierung\n"
-        "  aenderungstyp = Redaktionelle Korrektur\n"
-        "  schweregrad = niedrig\n\n"
-        "ERLAUBT:\n"
-        "  - eindeutige Orthografiefehler\n"
-        "  - eindeutige Zeichensetzungsfehler\n"
-        "  - eindeutige lokale Grammatikfehler\n"
-        "  - eindeutige formale Referenz- oder Adressierungsfehler\n\n"
-        "NICHT ERLAUBT:\n"
-        "  - Stilverbesserungen oder schönere Formulierungen\n"
-        "  - minimale Umformulierungen ohne klaren Fehler\n"
-        "  - Terminologieangleichungen oder 'konsistenter Gebrauch'\n"
-        "  - Eigennamen, Produktnamen, Institutionen, Marken, Fahrzeugbezeichnungen, Aktenzeichen\n"
-        "  - Abkürzungen, sofern nicht eindeutig falsch ausgeschrieben\n"
-        "  - Korrekturen innerhalb von Anführungszeichen\n"
-        "  - jede Korrektur, bei der du nicht mit sehr hoher Sicherheit sagen kannst, dass der Vorschlag korrekt ist\n"
-        "  - 'ss' als Fehler melden: In der Schweiz ist 'ss' korrekt\n\n"
-        "Wenn kein eindeutiger Fehler vorliegt, antworte exakt mit: {\"errors\":[]}\n\n"
-        "FELDER — exakt diese Namen, keine anderen:\n"
-        "  hauptklasse, subklasse, aenderungstyp, schweregrad\n"
-        "  stelle_im_segment   exakter Originalausschnitt\n"
-        "  begruendung         warum der Fehler eindeutig ist\n"
-        "  vorschlag           nur wenn eindeutig korrekt\n\n"
-        "Format:\n"
-        "{\"errors\":[{"
-        "\"hauptklasse\":\"Formales\","
-        "\"subklasse\":\"Redaktionelle Korrektur\","
-        "\"aenderungstyp\":\"Redaktionelle Korrektur\","
-        "\"schweregrad\":\"niedrig\","
-        "\"stelle_im_segment\":\"<exakter Originalausschnitt>\","
-        "\"begruendung\":\"<warum der Fehler eindeutig ist>\","
-        "\"vorschlag\":\"<nur wenn eindeutig korrekt>\"}]}"
+            _AGENT_JSON_PREFIX +
+
+            "Du bist Agent 3: Sprach- und Formalprüfer.\n"
+            "Du meldest NUR eindeutige, lokale formale Fehler.\n\n"
+
+            "Zulässige Taxonomie:\n"
+            "  hauptklasse = Formales\n"
+            "  subklasse   = Redaktionelle Korrektur | Referenzen (formal) | Dokumentstruktur | Adressierung\n"
+            "  aenderungstyp = Redaktionelle Korrektur | schweregrad = niedrig\n\n"
+
+            "ERLAUBT: eindeutige Orthografie-, Zeichensetzungs-, Grammatik- oder Adressierungsfehler.\n"
+            "NICHT ERLAUBT:\n"
+            "  - Stilverbesserungen, Umformulierungen, Terminologieangleichungen\n"
+            "  - Eigennamen, Produktnamen, Institutionen, Marken, Fahrzeugbezeichnungen, Aktenzeichen\n"
+            "  - Abkürzungen (sofern nicht eindeutig falsch ausgeschrieben)\n"
+            "  - Korrekturen innerhalb von Anführungszeichen\n"
+            "  - Korrekturen ohne sehr hohe Sicherheit\n"
+            "  - 'ss', 'gross', 'Grösse', 'grosszügig' u.ä.: In der Schweiz ist ss korrekt,\n"
+            "    NIEMALS als Fehler melden. 'mutmaßlich' → korrekt ist 'mutmasslich' (ss).\n"
+            "  - Kein Vorschlag vorhanden (vorschlag leer): kein Finding — das Wort ist ein\n"
+            "    Fachbegriff, Eigenname oder korrektes Kompositum.\n"
+            "  - Komposita NIEMALS aufteilen: 'zurückzukehrte', 'herumwirbelnde',\n"
+            "    'brandbetroffene', 'lagekorrekt' sind korrekte deutsche Komposita.\n"
+            "    Ein Leerzeichen einzufügen ('zurück zukehrte') ist IMMER falsch.\n"
+            "  - Grammatikkorrekturen die die Bedeutung ändern sind verboten: 'elektrischer\n"
+            "    Weidezaun' (Nominativ m.) ist korrekt — nicht 'elektrisches Zaun'.\n"
+            "    Adjektivbeugung nur melden wenn der Kasus eindeutig falsch ist.\n\n"
+
+            "Kein eindeutiger Fehler → {\"errors\":[]}\n\n"
+
+            "stelle_im_segment muss ein KURZER Ausschnitt sein (max. 4 Wörter), nicht ein ganzer Satz.\n\n"
+
+            "Format (Beispiel: einzelnes falsch geschriebenes Wort):\n"
+            "{\"errors\":[{\"hauptklasse\":\"Formales\",\"subklasse\":\"Redaktionelle Korrektur\","
+            "\"aenderungstyp\":\"Redaktionelle Korrektur\",\"schweregrad\":\"niedrig\","
+            "\"stelle_im_segment\":\"zurückzukehrte\","
+            "\"begruendung\":\"Konjugationsfehler: korrekt ist 'zurückkehrte'.\","
+            "\"vorschlag\":\"zurückkehrte\"}]}"
     )
     user = (
         f"DOKUMENTSEGMENT:\n{segment_text.strip()}\n\n"
@@ -2289,6 +2526,7 @@ def build_segment_evidences(
             mmr_lambda=args.mmr_lambda,
             max_per_source=args.max_per_source,
             mode="segment",
+            query_expander=getattr(args, "query_expander", None),
             case_id=args.case_id,
             rules_top_k=per_segment_rules_top_k,
             material_top_k=per_segment_material_top_k,
@@ -2317,25 +2555,100 @@ def build_segment_evidences(
 
 # ── Agent 2 / Agent 3 execution ───────────────────────────────────────────────
 
+def _dedup_material_sources(
+        sources: List[EvidenceSource],
+        similarity_threshold: float = 0.72,
+) -> List[EvidenceSource]:
+    """
+    Option 4: Dedupliziert semantisch ähnliche Materialreferenzen
+    vor dem Agent-2-Call mittels Token-level Jaccard.
+
+    Verhindert dass dasselbe Thema aus N leicht verschiedenen Chunksn
+    N separate Findings erzeugt (z.B. "H5 zur Ursache" 6× aus 6 Chunks).
+    Pro Cluster wird nur der Chunk mit dem höchsten Retrieval-Score behalten.
+
+    similarity_threshold: 0.72 ist konservativ genug um echte Varianten
+    zu erhalten, aggressiv genug um Fast-Duplikate zu eliminieren.
+    """
+    if len(sources) <= 2:
+        return sources
+
+    # Sortiere absteigend nach Score — bei Duplikaten den besten behalten
+    sorted_srcs = sorted(sources, key=lambda s: s.score, reverse=True)
+    kept: List[EvidenceSource] = []
+
+    for src in sorted_srcs:
+        src_tokens = set(src.text.lower().split())
+        is_near_duplicate = False
+        for k in kept:
+            k_tokens = set(k.text.lower().split())
+            intersection = len(src_tokens & k_tokens)
+            union = len(src_tokens | k_tokens)
+            jaccard = intersection / union if union else 0.0
+            if jaccard >= similarity_threshold:
+                is_near_duplicate = True
+                break
+        if not is_near_duplicate:
+            kept.append(src)
+
+    if len(kept) < len(sources):
+        print(
+            f"[MATERIAL-DEDUP] {len(sources)} → {len(kept)} Materialreferenzen "
+            f"(threshold={similarity_threshold:.2f})"
+        )
+    return kept
+
+
 def _dedup_factual_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Drop findings within the same segment that share identical source_refs
-    and identical begruendung prefix (first 80 chars).
-    Prevents the model from emitting the same RAG-referenced finding
-    multiple times with slightly different span texts.
+    Zwei-stufige Deduplizierung innerhalb einer Findings-Liste:
 
-    Zusätzlich: dokumentweite Deduplizierung für STRUKT_EVIDENZ —
-    derselbe Span wird manchmal in mehreren Segmenten gemeldet.
+    Stufe 1 — source_refs + begruendung (bestehend):
+        Verwirft Findings die exakt dieselben source_refs und denselben
+        begruendung-Prefix (80 Zeichen) haben. Verhindert dass das LLM
+        dasselbe RAG-referenzierte Finding mehrfach mit leicht variiertem
+        span_text ausgibt.
+
+    Stufe 2 — span_text (neu):
+        Verwirft Findings die denselben normalisierten span_text haben,
+        unabhängig von subclass oder agent. Verhindert dass deterministischer
+        Guard und LLM-Agent denselben Span doppelt melden (z.B. Date-Guard
+        als QMQS_DOKPFLICHT und Agent 2 als STRUKT_BEFUND_BESCHREIBUNG).
+        Bei Kollision gewinnt das erste Finding in der Liste — deterministische
+        Guard-Findings werden vor LLM-Findings einsortiert und haben daher
+        Priorität (siehe run_detect / check_document).
     """
-    seen: set = set()
-    out: List[Dict[str, Any]] = []
+    # Stufe 1: source_refs + begruendung
+    seen_refs: set = set()
+    stage1: List[Dict[str, Any]] = []
     for f in findings:
         refs = tuple(sorted(f.get("source_refs") or []))
         beg = (f.get("begruendung") or "")[:80]
         key = (refs, beg)
-        if key not in seen:
-            seen.add(key)
-            out.append(f)
+        if key not in seen_refs:
+            seen_refs.add(key)
+            stage1.append(f)
+
+    # Stufe 2: span_text — normalisiert, case-insensitive, max 120 Zeichen
+    seen_spans: set = set()
+    out: List[Dict[str, Any]] = []
+    for f in stage1:
+        raw_span = (
+                f.get("span_text")
+                or f.get("stelle_im_segment")
+                or ""
+        )
+        span_key = " ".join(str(raw_span).split()).lower()[:120]
+        if span_key and span_key in seen_spans:
+            print(
+                f"[DEDUP-SPAN] span={span_key[:60]!r} bereits gemeldet "
+                f"(subclass={f.get('subclass_id') or f.get('subklasse')!r}) "
+                f"-- uebersprungen"
+            )
+            continue
+        if span_key:
+            seen_spans.add(span_key)
+        out.append(f)
     return out
 
 
@@ -2431,6 +2744,94 @@ def check_zweifel_violations(
     return findings
 
 
+def _verify_strukt_befund_finding(
+        finding: Dict[str, Any],
+        segment_text: str,
+        material_sources: List[EvidenceSource],
+        min_value_jaccard_distance: float = 0.25,
+) -> bool:
+    """
+    Option 3: Verifikation von STRUKT_BEFUND_BESCHREIBUNG-Findings.
+
+    Ein Finding wird nur akzeptiert wenn:
+    1. stelle_im_segment wörtlich im Segmenttext vorkommt.
+    2. Die Begründung eine Materialreferenz ([Sx_Mn]) enthält.
+    3. Der behauptete Gegenwert (aus der Begründung extrahiert) tatsächlich
+       in einer Materialreferenz vorkommt — verhindert Halluzinationen.
+    4. stelle_im_segment und Gegenwert unterscheiden sich ausreichend
+       (Jaccard-Distanz >= min_value_jaccard_distance) — verhindert
+       triviale Abweichungen wie "19:00 Uhr" vs "19:02 Uhr".
+    """
+    import re as _re
+
+    # Nur für STRUKT_BEFUND_BESCHREIBUNG
+    if finding.get("subklasse") != "Beschreibung von Befunden":
+        return True
+
+    stelle = str(finding.get("stelle_im_segment") or "").strip()
+    begruendung = str(finding.get("begruendung") or "").strip()
+
+    # 1. Span muss im Segment vorkommen
+    if stelle and stelle not in segment_text:
+        print(f"[VERIFY-DROP] stelle_im_segment nicht im Segment: {stelle[:60]!r}")
+        return False
+
+    # 2. Muss eine Materialreferenz enthalten (nicht nur DOC_INTERNAL)
+    has_material_ref = bool(_re.search(r"\[S\d+_M_\d+\]", begruendung))
+    source_refs = finding.get("source_refs") or []
+    has_external_ref = any(
+        r and r not in ("DOC_INTERNAL", "", None)
+        for r in source_refs
+    )
+    if not has_material_ref and not has_external_ref:
+        # DOC_INTERNAL-only ist für STRUKT_BEFUND_BESCHREIBUNG nicht ausreichend
+        print(f"[VERIFY-DROP] STRUKT_BEFUND ohne Materialreferenz: {stelle[:60]!r}")
+        return False
+
+    # 3. Extrahiere Gegenwert aus Begründung — Text nach dem letzten ":" oder
+    #    nach Muster "war X", "ist X", "nennt X" (max. 6 Tokens)
+    counter_value = ""
+    # Muster: "Laut [S3_M_1]: <Gegenwert>" — nimm alles nach dem letzten Doppelpunkt
+    colon_match = _re.search(r":\s*(.{3,80})$", begruendung.strip())
+    if colon_match:
+        counter_value = colon_match.group(1).strip()
+
+    if counter_value:
+        # 3a. Gegenwert muss in mindestens einer Materialreferenz vorkommen
+        counter_lower = counter_value.lower()
+        # Wir prüfen nur die ersten 60 Zeichen des Gegenwerts (Kernaussage)
+        counter_key = counter_lower[:60]
+        found_in_material = any(
+            counter_key in src.text.lower()
+            for src in material_sources
+        )
+        if not found_in_material and len(counter_value) < 100:
+            print(
+                f"[VERIFY-DROP] Gegenwert nicht in Materialreferenzen: "
+                f"{counter_value[:60]!r}"
+            )
+            return False
+
+        # 3b. Jaccard-Distanz zwischen Span und Gegenwert
+        # Zu ähnliche Werte (z.B. "19:00 Uhr" vs "19:02 Uhr") werden verworfen
+        stelle_tokens = set(stelle.lower().split())
+        counter_tokens = set(counter_value.lower().split())
+        if stelle_tokens and counter_tokens:
+            union = len(stelle_tokens | counter_tokens)
+            intersection = len(stelle_tokens & counter_tokens)
+            jaccard_sim = intersection / union if union else 0.0
+            jaccard_dist = 1.0 - jaccard_sim
+            if jaccard_dist < min_value_jaccard_distance:
+                print(
+                    f"[VERIFY-DROP] Jaccard-Distanz zu gering "
+                    f"({jaccard_dist:.2f} < {min_value_jaccard_distance}): "
+                    f"{stelle[:40]!r} vs {counter_value[:40]!r}"
+                )
+                return False
+
+    return True
+
+
 def run_factual_agent(
         llm: LLMClient,
         evidence: SegmentEvidence,
@@ -2438,8 +2839,10 @@ def run_factual_agent(
         per_agent_context_chars: int,
         catalog: ErrorCatalog,
 ) -> List[Dict[str, Any]]:
+    # Option 4: Materialreferenzen vor dem Context-Build deduplizieren
+    material_sources_deduped = _dedup_material_sources(evidence.material_sources)
     rules_context = build_agent_context_from_sources(evidence.rules_sources, max_chars=per_agent_context_chars)
-    material_context = build_agent_context_from_sources(evidence.material_sources, max_chars=per_agent_context_chars)
+    material_context = build_agent_context_from_sources(material_sources_deduped, max_chars=per_agent_context_chars)
 
     messages = build_factual_review_messages(
         evidence.segment_text,
@@ -2461,34 +2864,87 @@ def run_factual_agent(
     findings = normalize_factual_errors(parsed.get("errors", []), catalog, segment_text=evidence.segment_text)
     findings = _dedup_factual_findings(findings)
 
-    # ── STRUKT_EVIDENZ nur mit externer Quelle melden ─────────────────────────
-    # DOC_INTERNAL-basierte Evidenz-Findings sind fast ausschliesslich
-    # False Positives: das System meldet Standard-Disclaimer-Sätze wie
-    # "in Kenntnis von Art. 307 StGB" oder "gemäss Angaben" als fehlende
-    # Quellenangabe, obwohl das korrekte Gutachtenformulierungen sind.
-    # Nur melden wenn mindestens eine echte externe Quelle (S*_R_* oder S*_M_*)
-    # den Befund stützt.
+    # Option 3: Span-Verifikation für STRUKT_BEFUND_BESCHREIBUNG
+    before_verify = len(findings)
+    findings = [
+        f for f in findings
+        if _verify_strukt_befund_finding(
+            f,
+            evidence.segment_text,
+            material_sources_deduped,
+        )
+    ]
+    dropped_verify = before_verify - len(findings)
+    if dropped_verify:
+        print(
+            f"[VERIFY-FILTER] S{evidence.segment_index}: "
+            f"{dropped_verify} STRUKT_BEFUND_BESCHREIBUNG verworfen"
+        )
+
+    # Option 1: Max-Findings-Limit pro Segment für STRUKT_BEFUND_BESCHREIBUNG.
+    # Ein Segment mit 1200 Zeichen kann realistisch max. 2 echte fachliche
+    # Fehler enthalten. Bei mehr ist es statistisches Rauschen.
+    _MAX_STRUKT_BEFUND_PER_SEGMENT = 2
+    strukt_befund = [f for f in findings if f.get("subklasse") == "Beschreibung von Befunden"]
+    other_findings = [f for f in findings if f.get("subklasse") != "Beschreibung von Befunden"]
+    if len(strukt_befund) > _MAX_STRUKT_BEFUND_PER_SEGMENT:
+        # Behalte die N mit dem höchsten Schweregrad (hoch > mittel > niedrig)
+        _severity_order = {"hoch": 0, "mittel": 1, "niedrig": 2}
+        strukt_befund_sorted = sorted(
+            strukt_befund,
+            key=lambda f: _severity_order.get(str(f.get("schweregrad") or "niedrig").lower(), 2)
+        )
+        dropped_limit = len(strukt_befund) - _MAX_STRUKT_BEFUND_PER_SEGMENT
+        strukt_befund = strukt_befund_sorted[:_MAX_STRUKT_BEFUND_PER_SEGMENT]
+        print(
+            f"[MAX-LIMIT] S{evidence.segment_index}: "
+            f"{dropped_limit} STRUKT_BEFUND_BESCHREIBUNG über Limit verworfen"
+        )
+    findings = other_findings + strukt_befund
+
+    # ── STRUKT_EVIDENZ: nur DOC_INTERNAL akzeptieren ─────────────────────────
+    # Fehlende Quellenangabe ist per Definition ein dokumentinternes Finding.
+    # Regelwerk- (_R_) und Material-Referenzen (_M_) sind kein valider Beleg
+    # dafür dass eine Quellenangabe fehlt — sie beschreiben das Regelwerk,
+    # nicht den Fehler im Dokument.
+    # Zusätzlich: Platzhalter-Referenzen wie "SRC_X_N" (aus dem Prompt-Beispiel)
+    # werden verworfen — das LLM hat den Beispiel-Ref direkt übernommen.
+    _VALID_EVIDENZ_REF_RE = re.compile(r"^S\\d+_[RM]_\\d+$")
+
+    def _is_valid_evidenz_ref(refs) -> bool:
+        """STRUKT_EVIDENZ ist gültig wenn source_refs == ["DOC_INTERNAL"] (exakt)."""
+        refs = [r for r in (refs or []) if r and r not in ("", None)]
+        if not refs:
+            return False
+        # Prompt-Platzhalter sind keine validen Referenzen
+        _PLACEHOLDER_REFS = {"SRC_X_N", "SRC_R_N", "SRC_M_N", "SRC_X_1", "SRC_N"}
+        if any(r in _PLACEHOLDER_REFS for r in refs):
+            return False
+        # Nur DOC_INTERNAL — keine Regelwerk- oder Materialreferenzen
+        return refs == ["DOC_INTERNAL"]
+
     before_evidenz = len(findings)
     findings = [
         f for f in findings
         if not (
                 f.get("subklasse") == "Evidenz / Belege"
-                and not any(
-            r not in ("DOC_INTERNAL", "", None)
-            for r in (f.get("source_refs") or [])
-        )
+                and not _is_valid_evidenz_ref(f.get("source_refs"))
         )
     ]
     dropped_evidenz = before_evidenz - len(findings)
     if dropped_evidenz:
         print(
             f"[DEBUG-EVIDENZ-FILTER] S{evidence.segment_index}: "
-            f"{dropped_evidenz} STRUKT_EVIDENZ ohne externe Quelle entfernt"
+            f"{dropped_evidenz} STRUKT_EVIDENZ mit ungültiger Referenz verworfen "
+            f"(nur DOC_INTERNAL erlaubt)"
         )
 
     for f in findings:
         f["segment_index"] = evidence.segment_index
     return findings
+
+
+
 
 
 
@@ -3033,9 +3489,16 @@ def run_language_agent(
     # ── Referenzfakten-Filter ────────────────────────────────────────────────
     # Ortsnamen, Personennamen und Institutionen aus den Referenzfakten
     # werden nicht als Rechtschreibfehler gemeldet.
-    if reference_words:
+    # Hinweis: Diese Hilfsfunktion wird auch nach dem LLM-Fallback angewendet,
+    # damit der Filter auch LLM-generierte Findings abdeckt.
+    def _apply_reference_words_filter(
+            findings: List[Dict[str, Any]],
+            reference_words: set,
+            segment_index: int,
+            label: str = "",
+    ) -> List[Dict[str, Any]]:
         before = len(findings)
-        findings = [
+        filtered = [
             f for f in findings
             if not any(
                 w in reference_words
@@ -3043,12 +3506,16 @@ def run_language_agent(
                 if len(w) >= 4
             )
         ]
-        dropped = before - len(findings)
+        dropped = before - len(filtered)
         if dropped:
             print(
-                f"[DEBUG-LANG-REFFILTER] S{evidence.segment_index}: "
+                f"[DEBUG-LANG-REFFILTER{('-' + label) if label else ''}] S{segment_index}: "
                 f"{dropped} Finding(s) durch Referenzfakten-Filter entfernt"
             )
+        return filtered
+
+    if reference_words:
+        findings = _apply_reference_words_filter(findings, reference_words, evidence.segment_index, label="DET")
 
     # ── Institutionsnamen-Filter ─────────────────────────────────────────────
     # Adjektiv-Grossschreibung in offiziellen Behörden-/Institutionsbezeichnungen
@@ -3128,6 +3595,14 @@ def run_language_agent(
         findings = filter_language_findings_by_plausibility(findings)
         findings = _dedup_language_findings(findings)
         findings = _dedup_spans_across_segments(findings, span_field="stelle_im_segment")
+
+        # Whitelist-Filter auch auf LLM-Fallback-Output anwenden —
+        # verhindert FPs bei Fachbegriffen, Komposita und Eigennamen
+        # die LanguageTool nicht kennt aber das LLM trotzdem meldet.
+        if reference_words:
+            findings = _apply_reference_words_filter(
+                findings, reference_words, evidence.segment_index, label="LLM"
+            )
 
         print(f"[DEBUG-LLM-LANG-FINAL] S{evidence.segment_index}: {findings}")
 
@@ -3449,7 +3924,22 @@ def filter_language_findings_by_plausibility(
 # ── Agent 4: Calculation Checker ─────────────────────────────────────────────
 
 def build_calculation_json_schema(catalog: ErrorCatalog) -> Dict[str, Any]:
-    """Grammar-constrained schema for Agent 4 — uses only the Rechenfehler main class."""
+    """Grammar-constrained schema for Agent 4 — uses only the Rechenfehler main class.
+
+    Design: LLM extracts the arithmetic expression and the claimed result from the
+    document text. Python evaluates and verifies — LLM never computes korrekter_wert.
+
+    Key fields:
+      expression      Arithmetic expression as a Python-evaluable string, e.g. "(81/1.7)*3.6".
+                      Only digits, operators (+−*/), parentheses, dots. No units, no text.
+                      Use empty string "" if no explicit expression is present in the text
+                      (e.g. pure unit errors).
+      claimed_result  The numeric value as stated in the document, e.g. 171.4.
+                      Use 0.0 if not applicable (unit-only findings).
+      decimal_places  Number of decimal places visible in the document result, e.g. 1 for "171.4".
+      wert_im_dokument  The claimed value as written in the document, including unit.
+      begruendung     Brief explanation why this looks like an error (before Python verification).
+    """
     rechen_subs = sorted(
         sub["label"]
         for sub in catalog.sub_by_main.get("RECHENFEHLER", {}).values()
@@ -3465,15 +3955,16 @@ def build_calculation_json_schema(catalog: ErrorCatalog) -> Dict[str, Any]:
             "aenderungstyp":     {"type": "string", "enum": change_labels},
             "schweregrad":       {"type": "string", "enum": sev_labels},
             "stelle_im_segment": {"type": "string"},
-            "berechnung":        {"type": "string"},
+            "expression":        {"type": "string"},
+            "claimed_result":    {"type": "number"},
+            "decimal_places":    {"type": "integer", "minimum": 0, "maximum": 6},
             "wert_im_dokument":  {"type": "string"},
-            "korrekter_wert":    {"type": "string"},
             "begruendung":       {"type": "string"},
         },
         "required": [
             "hauptklasse", "subklasse", "aenderungstyp", "schweregrad",
-            "stelle_im_segment", "berechnung", "wert_im_dokument",
-            "korrekter_wert", "begruendung",
+            "stelle_im_segment", "expression", "claimed_result", "decimal_places",
+            "wert_im_dokument", "begruendung",
         ],
     }
     return {
@@ -3488,58 +3979,65 @@ def build_calculation_review_messages(
         catalog: ErrorCatalog,
 ) -> List[Dict[str, str]]:
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
-        "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
-        "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
-        "Du bist Agent 4: Rechenprüfer für technische Dokumente.\n\n"
-        "Extrahiere alle numerischen Berechnungen aus dem Segment "
-        "(Geschwindigkeiten, Abstände, Zeiten, Umrechnungen, Prozentwerte, "
-        "Kräfte, Massen, Winkelmasse) und prüfe jeden Zahlenwert "
-        "rechnerisch Schritt für Schritt.\n\n"
-        "Rundungsregel (verbindlich für alle Berechnungen):\n"
-        "  Alle Endergebnisse werden durch Abschneiden auf 1 Nachkommastelle gebracht.\n"
-        "  Das bedeutet: Die zweite Nachkommastelle wird immer weggelassen, "
-        "unabhängig von ihrem Wert.\n"
-        "  Beispiele: 20.79 → 20.7 | 20.75 → 20.7 | 20.71 → 20.7\n"
-        "  NICHT kaufmännisch runden — 20.75 ist KEIN Fehler wenn das Dokument 20.7 schreibt.\n"
-        "  Ein Wert im Dokument gilt als korrekt, wenn er mit dem abgeschnittenen "
-        "Ergebnis übereinstimmt.\n\n"
-        "Melde NUR echte, nachweisbare Rechenfehler — "
-        "wenn der im Dokument genannte Wert nachweislich falsch ist.\n"
-        "Wenn alle Werte korrekt sind oder keine Berechnungen vorhanden sind: "
-        "{\"errors\":[]}\n\n"
-        "Zulässige Klassifikation:\n"
-        "  hauptklasse  = Rechenfehler\n"
-        "  subklasse    = Arithmetischer Fehler | Einheitenfehler | Rundungsfehler\n"
-        "  aenderungstyp = Rechnerische Korrektur\n"
-        "  schweregrad  = niedrig | mittel | hoch\n\n"
-        "FELDER — exakt diese Namen, keine anderen:\n"
-        "  hauptklasse        immer 'Rechenfehler'\n"
-        "  subklasse          Arithmetischer Fehler | Einheitenfehler | Rundungsfehler\n"
-        "  aenderungstyp      immer 'Rechnerische Korrektur'\n"
-        "  schweregrad        niedrig | mittel | hoch\n"
-        "  stelle_im_segment  exakter Originalausschnitt mit dem falschen Zahlenwert aus dem Segment\n"
-        "  berechnung         Rechnung Schritt für Schritt, Abschneiden auf 1 Nachkommastelle als letzter Schritt\n"
-        "  wert_im_dokument   der falsche Wert wie er im Dokument steht (mit Einheit)\n"
-        "  korrekter_wert     der korrekte Wert nach Abschneiden auf 1 Nachkommastelle (mit Einheit)\n"
-        "  begruendung        kurze Erklärung des Fehlers\n\n"
-        "Format — exakt so:\n"
-        "{\"errors\":[{"
-        "\"hauptklasse\":\"Rechenfehler\","
-        "\"subklasse\":\"Arithmetischer Fehler\","
-        "\"aenderungstyp\":\"Rechnerische Korrektur\","
-        "\"schweregrad\":\"hoch\","
-        "\"stelle_im_segment\":\"Durchschnittsgeschwindigkeit von 8.1 km/h\","
-        "\"berechnung\":\"21.60 m ÷ 10 s = 2.16 m/s × 3.6 = 7.776 km/h → abgeschnitten: 7.7 km/h\","
-        "\"wert_im_dokument\":\"8.1 km/h\","
-        "\"korrekter_wert\":\"7.7 km/h\","
-        "\"begruendung\":\"Umrechnung ergibt 7.776 km/h, abgeschnitten auf 1 Nachkommastelle: 7.7 km/h, nicht 8.1 km/h\"}]}"
+            _AGENT_JSON_PREFIX +
+
+            "Du bist Agent 4: Rechenprüfer für technische Dokumente.\n\n"
+
+            "AUFGABE: Identifiziere alle Stellen im Segment, an denen eine numerische "
+            "Berechnung steht (Geschwindigkeiten, Abstände, Zeiten, Umrechnungen, "
+            "Prozentwerte, Kräfte, Massen, Winkelmasse). "
+            "Extrahiere für jede Stelle den arithmetischen Ausdruck und den im Dokument "
+            "behaupteten Ergebniswert.\n\n"
+
+            "WICHTIG — Du rechnest NICHT nach und bestimmst NICHT den korrekten Wert. "
+            "Das macht Python nach deiner Extraktion. Deine einzige Aufgabe ist die "
+            "saubere Extraktion der folgenden Felder:\n\n"
+
+            "  expression       Der arithmetische Ausdruck exakt wie er sich aus dem Text "
+            "ergibt, als auswertbarer Python-String.\n"
+            "                   Nur Ziffern, Operatoren (+ - * /), Klammern, Punkte als "
+            "Dezimaltrenner.\n"
+            "                   Keine Einheiten, kein Text. Beispiel: \"(70/1.2)*2.6\"\n"
+            "                   Leer lassen (\"\") wenn kein expliziter Ausdruck vorhanden "
+            "(z.B. reine Einheitenfehler).\n\n"
+
+            "  claimed_result   Der im Dokument stehende Ergebniswert als reine Zahl, "
+            "ohne Einheit. Beispiel: 171.4\n\n"
+
+            "  decimal_places   Anzahl Nachkommastellen des Ergebniswerts im Dokument. "
+            "Beispiel: 1 für '11.8', 0 für '11', 2 für '12.14'\n\n"
+
+            "  wert_im_dokument Der behauptete Wert inklusive Einheit, exakt wie im "
+            "Dokument. Beispiel: \"11.8 km/h\"\n\n"
+
+            "  stelle_im_segment Originalausschnitt aus dem Dokument der den Fehler enthält.\n\n"
+
+            "  begruendung      Kurze Erklärung warum dieser Wert verdächtig ist "
+            "(ohne selbst nachzurechnen).\n\n"
+
+            "Melde NUR Stellen mit einem expliziten numerischen Ausdruck oder "
+            "Einheitenfehler. Kein Fehler erkennbar → {\"errors\":[]}\n\n"
+
+            "Klassifikation: hauptklasse='Rechenfehler' | "
+            "subklasse='Arithmetischer Fehler'|'Einheitenfehler'|'Rundungsfehler' | "
+            "aenderungstyp='Rechnerische Korrektur' | schweregrad=niedrig|mittel|hoch\n\n"
+
+            "Format:\n"
+            "{\"errors\":[{\"hauptklasse\":\"Rechenfehler\",\"subklasse\":\"Arithmetischer Fehler\","
+            "\"aenderungstyp\":\"Rechnerische Korrektur\",\"schweregrad\":\"hoch\","
+            "\"stelle_im_segment\":\"<Originalausschnitt>\","
+            "\"expression\":\"<auswertbarer Ausdruck oder leer>\","
+            "\"claimed_result\":<Zahl>,"
+            "\"decimal_places\":<int>,"
+            "\"wert_im_dokument\":\"<Wert mit Einheit>\","
+            "\"begruendung\":\"<kurze Erklärung>\"}]}"
     )
     user = (
         f"DOKUMENTSEGMENT:\n{segment_text.strip()}\n\n"
-        "Prüfe alle Zahlenwerte und Berechnungen rechnerisch. "
-        "Wende die Rundungsregel (Abschneiden auf 1 Nachkommastelle) auf alle Endergebnisse an. "
-        "Wenn kein Rechenfehler vorliegt, antworte mit {\"errors\":[]}."
+        "Extrahiere alle Stellen mit numerischen Berechnungen oder Einheitenfehlern. "
+        "Fülle expression, claimed_result und decimal_places sorgfältig aus — "
+        "Python verifiziert das Ergebnis. "
+        "Wenn keine solche Stelle vorhanden ist, antworte mit {\"errors\":[]}."
     )
     return [
         {"role": "system", "content": system},
@@ -3559,6 +4057,153 @@ def _format_seconds_value(value: float) -> str:
 def _parse_number_de_ch(value: str) -> float:
     """Parse decimal numbers with either dot or comma as decimal separator."""
     return float(str(value).strip().replace("'", "").replace(",", "."))
+
+
+# ── Safe arithmetic evaluator ─────────────────────────────────────────────────
+
+import ast as _ast
+import math as _math
+import decimal as _decimal
+
+_SAFE_OPS = {
+    _ast.Add: lambda a, b: a + b,
+    _ast.Sub: lambda a, b: a - b,
+    _ast.Mult: lambda a, b: a * b,
+    _ast.Div: lambda a, b: a / b,
+    _ast.USub: lambda a: -a,
+    _ast.UAdd: lambda a: a,
+}
+
+
+def _safe_eval_expr(node: _ast.expr) -> _decimal.Decimal:
+    """Recursively evaluate an AST node using only basic arithmetic.
+
+    Raises ValueError for any unsupported node type (function calls,
+    attribute access, imports, etc.) so LLM-injected code cannot execute.
+    """
+    if isinstance(node, _ast.Constant):
+        if not isinstance(node.value, (int, float)):
+            raise ValueError(f"Non-numeric constant: {node.value!r}")
+        return _decimal.Decimal(str(node.value))
+    if isinstance(node, _ast.BinOp):
+        op_fn = _SAFE_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        left = _safe_eval_expr(node.left)
+        right = _safe_eval_expr(node.right)
+        if isinstance(node.op, _ast.Div) and right == 0:
+            raise ValueError("Division by zero")
+        return op_fn(left, right)
+    if isinstance(node, _ast.UnaryOp):
+        op_fn = _SAFE_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+        return op_fn(_safe_eval_expr(node.operand))
+    raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+
+
+def evaluate_expression(expression: str) -> _decimal.Decimal:
+    """Parse and evaluate a plain arithmetic expression string safely.
+
+    Only digits, +, -, *, /, parentheses and decimal points are supported.
+    Any other content (function calls, names, imports) raises ValueError.
+
+    Examples:
+        evaluate_expression("(81/1.7)*3.6")  → Decimal('171.52941...')
+        evaluate_expression("25.320 - 15.320") → Decimal('10.000')
+    """
+    # Normalise: replace comma decimals and typographic minus variants
+    cleaned = (
+        expression.strip()
+        .replace(",", ".")
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    # Whitelist check: only allow chars that belong in an arithmetic expression
+    allowed = set("0123456789+-*/(). \t")
+    illegal = set(cleaned) - allowed
+    if illegal:
+        raise ValueError(f"Illegal characters in expression: {illegal!r}")
+    try:
+        tree = _ast.parse(cleaned, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"Invalid expression syntax: {e}") from e
+    return _safe_eval_expr(tree.body)
+
+
+def truncate_to_decimal_places(value: _decimal.Decimal, decimal_places: int) -> _decimal.Decimal:
+    """Truncate (floor towards zero) to n decimal places — not rounding.
+
+    Examples:
+        truncate(171.5294, 1) → 171.5
+        truncate(171.4705, 1) → 171.4
+        truncate(20.79,    1) → 20.7
+        truncate(20.75,    1) → 20.7   (NOT 20.8 — truncation, not rounding)
+    """
+    if decimal_places < 0:
+        decimal_places = 0
+    factor = _decimal.Decimal(10) ** decimal_places
+    # Use ROUND_DOWN which truncates toward zero (correct for positive values)
+    return (value * factor).to_integral_value(
+        rounding=_decimal.ROUND_DOWN
+    ) / factor
+
+
+def _decimal_places_in_claimed(claimed: float) -> int:
+    """Infer the number of decimal places from the claimed float value.
+
+    Used as fallback when the LLM omits decimal_places.
+    """
+    s = str(claimed)
+    if "." in s:
+        return len(s.split(".")[1].rstrip("0") or "0")
+    return 0
+
+
+def verify_calculation(
+        expression: str,
+        claimed_result: float,
+        decimal_places: int,
+        *,
+        plausibility_factor: float = 100.0,
+) -> Tuple[bool, str, str]:
+    """Evaluate expression and compare truncated result to claimed_result.
+
+    Returns:
+        (is_error, korrekter_wert, berechnung)
+        is_error        True when the claimed value is incorrect.
+        korrekter_wert  The correct truncated result as a string (with same
+                        decimal formatting as the document).
+        berechnung      Human-readable step string for the finding.
+
+    Raises ValueError if the expression cannot be evaluated.
+    """
+    computed = evaluate_expression(expression)
+    truncated = truncate_to_decimal_places(computed, decimal_places)
+
+    claimed_dec = _decimal.Decimal(str(claimed_result))
+    tolerance = _decimal.Decimal(10) ** (-decimal_places) * _decimal.Decimal("0.5")
+
+    # Plausibility guard: if computed is off by more than plausibility_factor
+    # from claimed, the expression was likely extracted incorrectly — skip.
+    if claimed_dec != 0:
+        ratio = float(abs(computed / claimed_dec))
+        if ratio > plausibility_factor or ratio < (1.0 / plausibility_factor):
+            raise ValueError(
+                f"Plausibility check failed: computed={float(computed):.6g}, "
+                f"claimed={claimed_result} (ratio={ratio:.2f})"
+            )
+
+    is_error = abs(truncated - claimed_dec) > tolerance
+
+    fmt = f".{decimal_places}f"
+    korrekter_wert_str = format(float(truncated), fmt)
+    berechnung = (
+        f"{expression} = {float(computed):.10g} "
+        f"→ abgeschnitten auf {decimal_places} Nachkommastelle(n): {korrekter_wert_str}"
+    )
+    return is_error, korrekter_wert_str, berechnung
 
 
 def check_time_difference_expressions(
@@ -3696,7 +4341,7 @@ _UNIT_DIMENSIONS: Dict[str, str] = {
 # wahrscheinlich um eine explizite Umrechnung → kein Finding.
 _CONVERSION_RE = re.compile(
     r"(?:entspricht|gleich|entsprechen|umgerechnet|"
-    r"ergibt|ergibt sich|bzw\.|oder|also|d\.h\.|"
+    r"ergibt|ergibt sich|bzw\.|d\.h\.|"
     r"=\s*\d)",
     re.IGNORECASE,
 )
@@ -3841,6 +4486,11 @@ def run_calculation_agent(
     findings: List[Dict[str, Any]] = []
     normalized_segment = " ".join(evidence.segment_text.split())
 
+    allowed_rechen_subs = {
+        sub["label"]
+        for sub in catalog.sub_by_main.get("RECHENFEHLER", {}).values()
+    }
+
     for item in parsed.get("errors", []):
         if not isinstance(item, dict):
             continue
@@ -3858,18 +4508,59 @@ def run_calculation_agent(
         subklasse = str(item.get("subklasse") or "Arithmetischer Fehler").strip()
         aenderungstyp = str(item.get("aenderungstyp") or "Rechnerische Korrektur").strip()
         schweregrad = str(item.get("schweregrad") or "hoch").strip()
+        wert_im_dokument = str(item.get("wert_im_dokument") or "").strip()
+        begruendung = str(item.get("begruendung") or "").strip()
 
-        # Validate against catalog
-        allowed_rechen_subs = {
-            sub["label"]
-            for sub in catalog.sub_by_main.get("RECHENFEHLER", {}).values()
-        }
         if subklasse not in allowed_rechen_subs:
             subklasse = "Arithmetischer Fehler"
         if aenderungstyp not in catalog.allowed_change_labels:
             aenderungstyp = "Rechnerische Korrektur"
         if schweregrad not in catalog.allowed_severity_labels:
             schweregrad = "hoch"
+
+        expression = str(item.get("expression") or "").strip()
+        claimed_result = item.get("claimed_result")
+        decimal_places = item.get("decimal_places")
+
+        # ── Python verifies arithmetic; LLM never sets korrekter_wert ────────
+        if expression and claimed_result is not None:
+            try:
+                claimed_float = float(claimed_result)
+                dp = int(decimal_places) if decimal_places is not None else _decimal_places_in_claimed(claimed_float)
+                dp = max(0, min(dp, 6))
+
+                is_error, korrekter_wert_str, berechnung_str = verify_calculation(
+                    expression, claimed_float, dp,
+                )
+                if not is_error:
+                    print(
+                        f"[CALC-OK] S{evidence.segment_index} "
+                        f"expression={expression!r} claimed={claimed_float} → correct, skipping"
+                    )
+                    continue
+
+                # Extract unit from wert_im_dokument for korrekter_wert label
+                unit_match = re.search(r"[^\d.,\s].*$", wert_im_dokument.strip())
+                unit_suffix = (" " + unit_match.group(0).strip()) if unit_match else ""
+                korrekter_wert = korrekter_wert_str + unit_suffix
+
+                print(
+                    f"[CALC-ERROR] S{evidence.segment_index} "
+                    f"expression={expression!r} claimed={claimed_float} "
+                    f"→ correct={korrekter_wert_str}"
+                )
+
+            except (ValueError, ZeroDivisionError, Exception) as exc:
+                print(
+                    f"[SKIP calc expression] S{evidence.segment_index} "
+                    f"expression={expression!r}: {exc}"
+                )
+                continue
+        else:
+            # No evaluable expression (e.g. unit-only finding) —
+            # keep the finding but leave berechnung and korrekter_wert empty.
+            berechnung_str = ""
+            korrekter_wert = ""
 
         findings.append({
             "segment_index": evidence.segment_index,
@@ -3878,11 +4569,11 @@ def run_calculation_agent(
             "aenderungstyp": aenderungstyp,
             "schweregrad": schweregrad,
             "stelle_im_segment": stelle,
-            "berechnung": str(item.get("berechnung") or "").strip(),
-            "wert_im_dokument": str(item.get("wert_im_dokument") or "").strip(),
-            "korrekter_wert": str(item.get("korrekter_wert") or "").strip(),
-            "begruendung": str(item.get("begruendung") or "").strip(),
-            "vorschlag": str(item.get("vorschlag") or "").strip(),
+            "berechnung": berechnung_str,
+            "wert_im_dokument": wert_im_dokument,
+            "korrekter_wert": korrekter_wert,
+            "begruendung": begruendung,
+            "vorschlag": "",
         })
 
     return _dedup_calculation_findings(deterministic_findings + findings)
@@ -3961,95 +4652,47 @@ def build_hypothesis_review_messages(
         catalog: ErrorCatalog,
 ) -> List[Dict[str, str]]:
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
-        "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
-        "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
+            _AGENT_JSON_PREFIX +
 
-        "Du bist Agent 5: Hypothesen-Konsistenzprüfer für technische Gutachten.\n\n"
+            "Du bist Agent 5: Hypothesen-Konsistenzprüfer für technische Gutachten.\n\n"
 
-        "Deine Aufgabe:\n"
-        "1. Identifiziere alle Hypothesen im Dokument, z.B. 'Hypothese', 'H1', 'H2', "
-        "'Unter der Annahme', 'Es wird angenommen', 'Falls'.\n"
-        "2. Finde die zugehörige Diskussion, Befundbewertung oder spätere Gesamtwertung "
-        "zu jeder Hypothese. Suche nicht nur direkt unter der Hypothese, sondern auch in "
-        "Abschnitten wie 'Diskussion', 'Wertung', 'Beurteilung', 'Schlussfolgerung', "
-        "'Gesamtwürdigung' oder 'Fazit'.\n"
-        "3. Extrahiere die relevanten Befunde aus dem gesamten Dokument, die für oder gegen "
-        "jede Hypothese sprechen.\n"
-        "4. Prüfe, ob die Schlussbewertung der Hypothese zu diesen Befunden passt.\n"
-        "5. Prüfe zusätzlich, ob Diskussion und spätere Wertung einander widersprechen.\n"
-        "6. Melde NUR nachweisbare Inkonsistenzen.\n\n"
+            "Aufgabe:\n"
+            "1. Identifiziere alle Hypothesen (z.B. 'Hypothese', 'H1', 'H2', "
+            "'Unter der Annahme', 'Es wird angenommen', 'Falls').\n"
+            "2. Finde die zugehörige Diskussion/Bewertung — auch in späteren Abschnitten "
+            "('Diskussion', 'Wertung', 'Beurteilung', 'Schlussfolgerung', 'Fazit').\n"
+            "3. Prüfe ob Schlussbewertung und Befunde zusammenpassen.\n"
+            "4. Melde NUR nachweisbare Inkonsistenzen — keine Spekulationen.\n\n"
 
-        "Bewertungslogik:\n"
-        "- Prüfe jede Hypothese mit einer inneren Pro-/Contra-Matrix.\n"
-        "- Eine Hypothese ist nur plausibel, wenn konkrete Befunde im Dokument sie stützen.\n"
-        "- Eine Hypothese ist wenig plausibel, wenn konkrete Befunde im Dokument gegen sie sprechen "
-        "oder tragende Befunde fehlen.\n"
-        "- Bei gegenseitig ausschliessenden Hypothesen dürfen nicht beide gleich stark gestützt werden, "
-        "ausser das Dokument begründet dies ausdrücklich.\n"
-        "- Eine Absichtshypothese, z.B. 'sah die Fussgänger und fuhr absichtlich über sie', "
-        "darf nur als sehr plausibel oder sehr stark gestützt bewertet werden, wenn konkrete "
-        "dokumentierte Befunde für Absicht, bewusstes Wahrnehmen oder gezieltes Handeln genannt werden.\n"
-        "- Wenn solche konkreten Befunde fehlen und die Bewertung trotzdem 'sehr plausibel', "
-        "'sehr stark gestützt' oder gleichwertig lautet, ist dies eine Inkonsistenz.\n"
-        "- Wenn eine spätere Wertung eine Hypothese anders bewertet als die vorherige Diskussion, "
-        "ohne den Wechsel zu begründen, ist dies eine Inkonsistenz.\n"
-        "- Melde keine reine Umformulierung und keine Vermutung. Die Inkonsistenz muss aus dem "
-        "Dokumenttext ableitbar sein.\n\n"
+            "Grundregel: Eine Hypothese ist nur plausibel wenn Befunde sie stützen. "
+            "Widerspruch zwischen Diskussion und späterer Wertung ohne Begründung ist eine Inkonsistenz.\n\n"
 
-        "Zulässige Fehlertypen:\n"
-        "  Hypothesen-Befund-Widerspruch       Befundbewertung widerspricht der Hypothese direkt\n"
-        "  Fehlende Befundbewertung            Hypothese bleibt ohne Befundbewertung\n"
-        "  Inkonsistente Hypothesenbewertung   Gleiche Befunde, widersprüchliche Schlussfolgerungen\n"
-        "  Unbegründete Hypothese              Hypothese oder Bewertung ohne sachliche Grundlage\n\n"
+            "Subklassen: Hypothesen-Befund-Widerspruch | Fehlende Befundbewertung | "
+            "Inkonsistente Hypothesenbewertung | Unbegründete Hypothese\n"
+            "Klassifikation: hauptklasse='Hypothesenprüfung' | aenderungstyp='Hypothesen-Korrektur'\n\n"
 
-        "Zulässige Klassifikation:\n"
-        "  hauptklasse   = Hypothesenprüfung\n"
-        "  subklasse     = Hypothesen-Befund-Widerspruch | Fehlende Befundbewertung | "
-        "Inkonsistente Hypothesenbewertung | Unbegründete Hypothese\n"
-        "  aenderungstyp = Hypothesen-Korrektur\n"
-        "  schweregrad   = niedrig | mittel | hoch\n\n"
+            "Alle Textausschnitte müssen wörtlich aus dem Dokument stammen.\n"
+            "Keine Hypothesen oder alle konsistent → {\"errors\":[]}\n\n"
 
-        "FELDER — exakt diese Namen, keine anderen:\n"
-        "  hauptklasse          immer 'Hypothesenprüfung'\n"
-        "  subklasse            einer der vier Fehlertypen oben\n"
-        "  aenderungstyp        immer 'Hypothesen-Korrektur'\n"
-        "  schweregrad          niedrig | mittel | hoch\n"
-        "  hypothese_text       exakter Originalausschnitt der Hypothese aus dem Dokument\n"
-        "  befundbewertung_text exakter Originalausschnitt der Befundbewertung, Diskussion oder Wertung; "
-        "leer wenn fehlend\n"
-        "  stelle_im_segment    exakter Originalausschnitt der problematischen Stelle, "
-        "bevorzugt aus der Bewertung oder Wertung\n"
-        "  begruendung          kurze Erklärung, warum Bewertung und Befunde nicht zusammenpassen\n\n"
-
-        "WICHTIG:\n"
-        "  - Alle Textausschnitte müssen wörtlich und unverändert aus dem Dokument stammen.\n"
-        "  - stelle_im_segment muss im Dokument wörtlich vorkommen.\n"
-        "  - Wenn keine Hypothesen im Dokument vorhanden sind: {\"errors\":[]}\n"
-        "  - Wenn alle Hypothesen konsistent bewertet sind: {\"errors\":[]}\n"
-        "  - Nur nachweisbare Inkonsistenzen melden — keine Spekulationen.\n"
-        "  - Bestätigungen korrekter Hypothesen sind verboten.\n\n"
-
-        "Format — exakt so:\n"
-        "{\"errors\":[{"
-        "\"hauptklasse\":\"Hypothesenprüfung\","
-        "\"subklasse\":\"Inkonsistente Hypothesenbewertung\","
-        "\"aenderungstyp\":\"Hypothesen-Korrektur\","
-        "\"schweregrad\":\"hoch\","
-        "\"hypothese_text\":\"<exakter Originalausschnitt der Hypothese>\","
-        "\"befundbewertung_text\":\"<exakter Originalausschnitt der Bewertung>\","
-        "\"stelle_im_segment\":\"<problematischer Originalausschnitt>\","
-        "\"begruendung\":\"<Erklärung der Inkonsistenz>\"}]}"
+            "Format:\n"
+            "{\"errors\":[{\"hauptklasse\":\"Hypothesenprüfung\",\"subklasse\":\"<Fehlertyp>\","
+            "\"aenderungstyp\":\"Hypothesen-Korrektur\",\"schweregrad\":\"<niedrig|mittel|hoch>\","
+            "\"hypothese_text\":\"<Originalausschnitt Hypothese>\","
+            "\"befundbewertung_text\":\"<Originalausschnitt Bewertung oder leer>\","
+            "\"stelle_im_segment\":\"<problematischer Originalausschnitt>\","
+            "\"begruendung\":\"<Erklärung der Inkonsistenz>\"}]}"
     )
 
     user = (
         f"DOKUMENT:\n{doc_text.strip()}\n\n"
-        "Prüfe die Hypothesen und ihre Diskussionen anhand des gesamten Dokuments. "
-        "Berücksichtige ausdrücklich auch spätere Abschnitte wie Wertung, Beurteilung, "
-        "Schlussfolgerung, Gesamtwürdigung oder Fazit. "
-        "Vergleiche für jede Hypothese die dokumentierten Befunde mit der Schlussbewertung. "
-        "Melde nur echte Widersprüche zwischen Befunden, Hypothese, Diskussion und Wertung. "
-        "Wenn keine Inkonsistenz vorliegt, antworte mit {\"errors\":[]}."
+        "Prüfe alle Hypothesen gegen Diskussion und Wertung. "
+        "Berücksichtige spätere Abschnitte (Wertung, Schlussfolgerung, Fazit). "
+        "Spezialfall — wenn Absichtshypothesen vorkommen: Prüfe ob konkrete Befunde "
+        "für Absicht oder gezieltes Handeln im Dokument genannt werden; "
+        "fehlen sie bei einer 'sehr plausibel'-Bewertung, ist das eine Inkonsistenz. "
+        "Bei gegenseitig ausschliessenden Hypothesen: Prüfe ob beide gleich stark bewertet werden "
+        "ohne dokumentierte Begründung. "
+        "Melde nur echte Widersprüche. Wenn keine Inkonsistenz vorliegt: {\"errors\":[]}. "
     )
 
     return [
@@ -4286,8 +4929,8 @@ def check_dates_within_event_window(
         segments: List[str],
         reference_facts: Dict[str, Any],
         *,
-        max_years_after_event: int = 3,
-        max_years_before_event: int = 2,
+        max_years_after_event: int = 5,
+        max_years_before_event: int = 1,
 
 ) -> List[Dict[str, Any]]:
     """
@@ -4458,47 +5101,41 @@ def build_reference_consistency_review_messages(
     compact_facts = _compact_reference_facts_for_consistency(reference_facts)
 
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
-        "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
-        "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
-        "Du bist Agent 6: Referenzfakten-Konsistenzprüfer für forensische Gutachten.\n"
-        "Du prüfst das GESAMTE DOKUMENT gegen die REFERENZFAKTEN aus Agent 0.\n\n"
-        "Deine Aufgabe:\n"
-        "1. Verwende nur Referenzfakten mit confidence high oder medium und nicht-leerem value.\n"
-        "2. Melde NUR echte Widersprüche: Im Dokument steht ein konkreter anderer Wert als der Referenzwert.\n"
-        "3. Melde NICHT, dass ein Referenzfakt in einem Abschnitt fehlt. Fehlende Wiederholung ist kein Fehler.\n"
-        "4. Melde NICHT den source_span des Referenzfakts selbst als Fehler.\n"
-        "5. Jede stelle_im_segment muss ein wörtlicher Originalausschnitt aus dem Dokument sein, der den abweichenden Wert enthält.\n"
-        "6. Wenn du keine wörtliche Stelle aus dem Dokument nennen kannst, gib kein Finding aus.\n\n"
-        "Typische Widersprüche:\n"
-        "- Referenz auftraggeber = Staatsanwaltschaft Schwyz, Dokumentstelle nennt Jugendanwaltschaft Obwalden.\n"
-        "- Referenz person = Joel GERBER, Dokumentstelle nennt Joel Wacker oder Joel GERBE.\n"
-        "- Referenz ort = Lachen SZ, Dokumentstelle nennt einen anderen Unfallort.\n"
-        "- Referenz ereignisdatum = 2024-05-02, Dokumentstelle nennt 2. Mai 2030; "
-        "dies liegt ausserhalb des zulässigen Zeitraums von drei Jahren nach dem Ereignisdatum.\n\n"
-        "Nicht melden:\n"
-        "- fehlende Angaben | unvollständige Wiederholungen | blosse Bestätigungen | Rechenfehler | Sprachfehler | Hypothesenfehler\n\n"
-        "Zulässige Werte:\n"
-        f"  hauptklasse: {hauptklassen}\n"
-        "  subklasse: passende Subklasse zur Hauptklasse\n"
-        f"  aenderungstyp: {aenderungstypen}\n"
-        "  schweregrad: niedrig | mittel | hoch\n\n"
-        "FELDER — exakt diese Namen, keine anderen:\n"
-        "  hauptklasse, subklasse, aenderungstyp, schweregrad\n"
-        "  reference_key      Feldname des Referenzfakts, z.B. auftraggeber oder personen\n"
-        "  reference_value    Referenzwert, gegen den die Dokumentstelle widerspricht\n"
-        "  stelle_im_segment  wörtlicher Originalausschnitt aus dem Dokument mit dem abweichenden Wert\n"
-        "  begruendung        kurze Erklärung des Widerspruchs\n\n"
-        "Format:\n"
-        "{\"errors\":[{"
-        "\"hauptklasse\":\"Struktur und Argumentation\","
-        "\"subklasse\":\"Beschreibung von Befunden\","
-        "\"aenderungstyp\":\"Fachliche Präzisierung\","
-        "\"schweregrad\":\"hoch\","
-        "\"reference_key\":\"auftraggeber\","
-        "\"reference_value\":\"Staatsanwaltschaft Schwyz\","
-        "\"stelle_im_segment\":\"Jugendanwaltschaft Obwalden\","
-        "\"begruendung\":\"Widerspruch: Referenzfakt Auftraggeber ist Staatsanwaltschaft Schwyz, im Dokument steht Jugendanwaltschaft Obwalden.\"}]}"
+            _AGENT_JSON_PREFIX +
+
+            "Du bist Agent 6: Referenzfakten-Konsistenzprüfer für forensische Gutachten.\n"
+            "Du prüfst das GESAMTE DOKUMENT gegen die REFERENZFAKTEN aus Agent 0.\n\n"
+
+            "Regeln:\n"
+            "1. Nur Referenzfakten mit confidence high/medium und nicht-leerem value verwenden.\n"
+            "2. Melde NUR echte Widersprüche: Dokument nennt anderen konkreten Wert als Referenzwert.\n"
+            "3. Fehlende Wiederholung eines Referenzfakts ist kein Fehler.\n"
+            "4. Den source_span des Referenzfakts selbst nicht als Fehler melden.\n"
+            "5. stelle_im_segment muss wörtlicher Originalausschnitt mit dem abweichenden Wert sein.\n"
+            "6. Keine wörtliche Stelle auffindbar → kein Finding.\n\n"
+
+            "Typische Widersprüche (generisch):\n"
+            "- Referenz auftraggeber = <Behörde A>, Dokumentstelle nennt <Behörde B>.\n"
+            "- Referenz person = <Name A>, Dokumentstelle nennt <Name B> (abweichender Name).\n"
+            "- Referenz ereignisdatum = <Datum A>, Dokumentstelle nennt <Datum B> "
+            "(mehr als 3 Jahre abweichend = ausserhalb des plausiblen Zeitraums).\n\n"
+
+            "Nicht melden: fehlende Angaben | Wiederholungen | Bestätigungen | "
+            "Rechenfehler | Sprachfehler | Hypothesenfehler\n\n"
+
+            f"Zulässige Werte: hauptklasse={hauptklassen} | "
+            f"aenderungstyp={aenderungstypen} | schweregrad=niedrig|mittel|hoch\n\n"
+
+            "Zusatzfelder: reference_key (Feldname des Referenzfakts) | "
+            "reference_value (Referenzwert) | stelle_im_segment | begruendung\n\n"
+
+            "Format:\n"
+            "{\"errors\":[{\"hauptklasse\":\"<Hauptklasse>\",\"subklasse\":\"<Subklasse>\","
+            "\"aenderungstyp\":\"<Änderungstyp>\",\"schweregrad\":\"<niedrig|mittel|hoch>\","
+            "\"reference_key\":\"<Feldname>\",\"reference_value\":\"<Referenzwert>\","
+            "\"stelle_im_segment\":\"<abweichender Originalausschnitt>\","
+            "\"begruendung\":\"Widerspruch: Referenzfakt <Feldname> ist <Referenzwert>, "
+            "im Dokument steht <abweichender Wert>.\"}]}"
     )
 
     user = (
@@ -4986,70 +5623,47 @@ def build_statement_assurance_review_messages(
     allowed_subs = ", ".join(recht_subs)
 
     system = (
-        "Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt.\n"
-        "Kein erklärender Text, keine Einleitung, kein Markdown, keine Kommentare.\n"
-        "Erste Zeichen deiner Antwort müssen '{\"errors\"' sein.\n\n"
+            _AGENT_JSON_PREFIX +
 
-        "Du bist Agent 7: Aussageabsicherungs-, Modalitäts- und Tatsachenstatus-Prüfer "
-        "für forensische Gutachten.\n"
-        "Du prüfst NUR die vorgegebenen KANDIDATEN, nicht das ganze Segment frei.\n\n"
+            "Du bist Agent 7: Aussageabsicherungs-, Modalitäts- und Tatsachenstatus-Prüfer "
+            "für forensische Gutachten.\n"
+            "Du prüfst NUR die vorgegebenen KANDIDATEN, nicht das ganze Segment frei.\n\n"
 
-        "Deine Aufgabe:\n"
-        "1. Prüfe, ob ein Kandidat eine unsichere, quellenbasierte, hypothetische "
-        "oder bewertende Aussage als sichere Tatsache formuliert.\n"
-        "2. Prüfe, ob Wille, Absicht oder innere Haltung zugeschrieben wird, obwohl der Satz "
-        "als Befund/Tatsache formuliert ist.\n"
-        "3. Prüfe, ob Konjunktiv-/Modalformulierungen wie 'hätte', 'könnte', 'wäre' "
-        "als gesicherte Tatsachenbehauptung erscheinen.\n"
-        "4. Melde NUR Kandidaten, bei denen der Tatsachenstatus tatsächlich unsauber ist.\n\n"
+            "Prüfe pro Kandidat:\n"
+            "1. Wird eine unsichere/quellenbasierte/hypothetische Aussage als Tatsache formuliert?\n"
+            "2. Wird Wille, Absicht oder innere Haltung als Befund/Tatsache formuliert?\n"
+            "3. Erscheinen Konjunktiv-/Modalformulierungen ('hätte', 'könnte', 'wäre') "
+            "als gesicherte Tatsachenbehauptung?\n"
+            "4. Steht ein Konditionalsatz (falls/wenn/sofern) mit Indikativ statt Konjunktiv II "
+            "im Hauptsatz, obwohl der Kontext Konjunktiv II erfordern würde?\n\n"
 
-        "Klassifikationsregeln:\n"
-        "- Zu absolute Quellen-/Wissensformulierung, z.B. 'Wir wissen aus unseren Quellen ...':\n"
-        "  hauptklasse='Rechtskonformität', subklasse='Aussageabsicherung', "
-        "aenderungstyp='Fachliche Präzisierung', schweregrad='mittel'.\n"
-        "- Konjunktiv, Hypothese, Bewertung oder Schlussfolgerung wird als Fakt dargestellt:\n"
-        "  hauptklasse='Rechtskonformität', subklasse='Trennung Befund/Bewertung', "
-        "aenderungstyp='Erweiterung der Argumentation', schweregrad='mittel'.\n"
-        "- Wille/Absicht ohne klare Befundgrundlage wird als Tatsache formuliert:\n"
-        "  hauptklasse='Rechtskonformität', subklasse='Trennung Befund/Bewertung', "
-        "aenderungstyp='Erweiterung der Argumentation', schweregrad='mittel'.\n"
-        "- Konditionalsatz (falls/wenn/sofern) mit Indikativ im Hauptsatz statt Konjunktiv:\n"
-        "  z.B. 'Falls Zweifel bestehen, werden Tachoeichungen durchgeführt' statt "
-        "'könnten...durchgeführt werden'. Prüfe ob der Kontext Konjunktiv II erfordern würde.\n"
-        "  hauptklasse='Rechtskonformität', subklasse='Trennung Befund/Bewertung', "
-        "aenderungstyp='Erweiterung der Argumentation', schweregrad='mittel'.\n\n"
+            "Klassifikation:\n"
+            "- Zu absolute Quellenformulierung → subklasse='Aussageabsicherung', "
+            "aenderungstyp='Fachliche Präzisierung'\n"
+            "- Konjunktiv/Hypothese/Bewertung/Wille als Fakt | Konditionalsatz-Indikativ → "
+            "subklasse='Trennung Befund/Bewertung', aenderungstyp='Erweiterung der Argumentation'\n"
+            "Immer: hauptklasse='Rechtskonformität' | schweregrad=mittel\n\n"
 
-        "Nicht melden:\n"
-        "- reine, korrekt als Hypothese markierte Sätze;\n"
-        "- klar relativierte Aussagen ('möglicherweise', 'unter der Annahme', 'gemäss Aktenlage') "
-        "ohne absolute Tatsachenbehauptung;\n"
-        "- Rechenfehler, Sprachfehler, Hypothesenbewertung.\n\n"
+            "Nicht melden:\n"
+            "  - korrekt markierte Hypothesen und klar relativierte Aussagen\n"
+            "    ('möglicherweise', 'unter der Annahme', 'gemäss Aktenlage')\n"
+            "  - Konjunktiv II in Widerlegungs- und Gegenhypothesen-Sätzen: Formulierungen wie\n"
+            "    'Wäre der Brand an Position B ausgebrochen, hätte/müsste/wäre...' sind\n"
+            "    KEIN Fehler — das ist der korrekte Gutachtenstil beim Widerlegen fremder Hypothesen.\n"
+            "  - Rechenfehler | Sprachfehler\n\n"
 
-        "Zulässige Subklassen unter Rechtskonformität:\n"
-        f"{allowed_subs}\n\n"
+            f"Zulässige Subklassen: {allowed_subs}\n\n"
 
-        "FELDER — exakt diese Namen, keine anderen:\n"
-        "  candidate_index    Index des Kandidaten\n"
-        "  hauptklasse        immer 'Rechtskonformität'\n"
-        "  subklasse          Aussageabsicherung ODER Trennung Befund/Bewertung\n"
-        "  aenderungstyp      Fachliche Präzisierung ODER Erweiterung der Argumentation\n"
-        "  schweregrad        niedrig | mittel | hoch\n"
-        "  stelle_im_segment  exakt der Kandidatentext, unverändert\n"
-        "  begruendung        kurze Erklärung, warum der Tatsachenstatus unsauber ist\n\n"
+            "stelle_im_segment muss exakt dem Kandidatentext entsprechen.\n"
+            "Kein fehlerhafter Kandidat → {\"errors\":[]}\n\n"
 
-        "WICHTIG:\n"
-        "- stelle_im_segment muss exakt einem Kandidatentext entsprechen.\n"
-        "- Wenn kein Kandidat wirklich fehlerhaft ist: {\"errors\":[]}\n\n"
-
-        "Format:\n"
-        "{\"errors\":[{"
-        "\"candidate_index\":1,"
-        "\"hauptklasse\":\"Rechtskonformität\","
-        "\"subklasse\":\"Aussageabsicherung\","
-        "\"aenderungstyp\":\"Fachliche Präzisierung\","
-        "\"schweregrad\":\"mittel\","
-        "\"stelle_im_segment\":\"Wir wissen aus unseren Quellen, dass folgendes vorgefallen ist.\","
-        "\"begruendung\":\"Quellenbasierte Rekonstruktion wird als sicheres Wissen formuliert; die Quelle und der Tatsachenstatus sind nicht ausreichend abgesichert.\"}]}"
+            "Format:\n"
+            "{\"errors\":[{\"candidate_index\":1,\"hauptklasse\":\"Rechtskonformität\","
+            "\"subklasse\":\"<Aussageabsicherung|Trennung Befund/Bewertung>\","
+            "\"aenderungstyp\":\"<Fachliche Präzisierung|Erweiterung der Argumentation>\","
+            "\"schweregrad\":\"mittel\","
+            "\"stelle_im_segment\":\"<exakter Kandidatentext>\","
+            "\"begruendung\":\"<warum Tatsachenstatus unsauber>\"}]}"
     )
 
     user = (
@@ -5176,7 +5790,7 @@ def run_statement_assurance_agent(
         *,
         catalog: ErrorCatalog,
 ) -> List[Dict[str, Any]]:
-    """Agent 7 — regex candidate prefilter + narrow LLM classification."""
+    """Agent 4 — regex candidate prefilter + narrow LLM classification."""
     candidates = extract_statement_assurance_candidates(evidence.segment_text, evidence.segment_index)
     print(
         f"[DEBUG-STATEMENT-CANDIDATES] S{evidence.segment_index}: "
@@ -5451,6 +6065,7 @@ def _retrieve_and_print(
         mmr_lambda=args.mmr_lambda,
         max_per_source=args.max_per_source,
         mode="qa",
+        query_expander=getattr(args, "query_expander", None),
         case_id=args.case_id,
         rules_top_k=args.rules_top_k,
         material_top_k=args.material_top_k,
@@ -5520,6 +6135,51 @@ def answer(
             chunk_str = f"  chunk {chunk_idx}" if chunk_idx is not None else ""
             print(f"  [{h.rank}] {doc}{chunk_str}  (score={h.score:.4f}, kind={kind})")
 
+class _AgentTimer:
+    """
+    Akkumuliert Laufzeiten pro Agent über alle Segment-Aufrufe hinweg.
+    Gibt am Ende einen formatierten Konsolenblock aus.
+    """
+    def __init__(self) -> None:
+        self._times: Dict[str, float] = {}
+        self._calls: Dict[str, int] = {}
+
+    def record(self, agent: str, elapsed: float) -> None:
+        self._times[agent] = self._times.get(agent, 0.0) + elapsed
+        self._calls[agent] = self._calls.get(agent, 0) + 1
+
+    def print_summary(self, n_segments: int) -> None:
+        W = 90
+        total = sum(self._times.values())
+        order = [
+            ("Agent 0", "agent0",               "Referenzfakten-Extraktor", False),
+            ("Agent 2", "factual",               "Fachprüfer",               True),
+            ("Agent 3", "language",              "Sprach-/Formalprüfer",     True),
+            ("Agent 4", "calculation",           "Rechenprüfer",             True),
+            ("Agent 7", "statement_assurance",   "Aussageabsicherung",       True),
+            ("Agent 5", "hypothesis",            "Hypothesenprüfer",         False),
+            ("Agent 6", "reference_consistency", "Referenzkonsistenz",       False),
+        ]
+        print("\n" + "=" * W)
+        print("LAUFZEITEN PRO AGENT")
+        print("=" * W)
+        print(f"  {'Agent':<8} {'Beschreibung':<30} {'Gesamt':>9}  {'Calls':>8}  {'Ø/Call':>8}  {'Anteil':>7}")
+        print("-" * W)
+        for label, key, desc, per_seg in order:
+            t = self._times.get(key, 0.0)
+            c = self._calls.get(key, 0)
+            avg = t / c if c else 0.0
+            pct = t / total * 100 if total else 0.0
+            calls_note = f"{c} Seg." if per_seg and c > 1 else f"{c} Call{'s' if c != 1 else ''}"
+            print(
+                f"  {label:<8} {desc:<30} "
+                f"{t:>7.1f}s  {calls_note:>8}  {avg:>6.2f}s  {pct:>6.1f}%"
+            )
+        print("-" * W)
+        print(f"  {'':8} {'GESAMT':<30} {total:>7.1f}s")
+        print("=" * W)
+
+
 def check_document(
         doc_path: Path,
         stores: List[RagStore],
@@ -5552,7 +6212,10 @@ def check_document(
     # Reset dokumentweiter Span-Dedup-Cache (pro Subklasse)
     _SEEN_SPANS_BY_SUBCLASS.clear()
 
+    _timer = _AgentTimer()
+
     reference_schema = load_reference_facts_schema(Path(args.reference_facts_schema).expanduser().resolve())
+    _t0 = time.perf_counter()
     reference_facts = run_reference_facts_agent(
         llm,
         doc_text,
@@ -5560,6 +6223,7 @@ def check_document(
         schema=reference_schema,
         max_chars=args.reference_facts_context_chars,
     )
+    _timer.record("agent0", time.perf_counter() - _t0)
     reference_facts_context = format_reference_facts_for_prompt(reference_facts)
 
     if args.print_reference_facts:
@@ -5657,7 +6321,7 @@ def check_document(
     reference_consistency_findings: List[Dict[str, Any]] = []
     statement_assurance_findings: List[Dict[str, Any]] = []
 
-    per_agent_context_chars = max(30000, args.context_max_chars // 3)
+    per_agent_context_chars = args.context_max_chars // 3
 
     # Referenzwörter: Referenzfakten + Domänen-Whitelist aus Material Store
     _ref_words: set = _build_reference_words_set(reference_facts)
@@ -5687,26 +6351,35 @@ def check_document(
 
     for ev in evidences:
         try:
+            _t0 = time.perf_counter()
             factual_findings.extend(
                 run_factual_agent(llm, ev, per_agent_context_chars=per_agent_context_chars, catalog=catalog)
             )
+            _timer.record("factual", time.perf_counter() - _t0)
         except Exception as e:
             print(f"[WARN] Factual agent failed for segment {ev.segment_index}: {e}")
 
+
         try:
+            _t0 = time.perf_counter()
             language_findings.extend(run_language_agent(llm, ev, catalog=catalog, reference_words=_ref_words))
+            _timer.record("language", time.perf_counter() - _t0)
         except Exception as e:
             print(f"[WARN] Language agent failed for segment {ev.segment_index}: {e}")
 
         try:
+            _t0 = time.perf_counter()
             calculation_findings.extend(run_calculation_agent(llm, ev, catalog))
+            _timer.record("calculation", time.perf_counter() - _t0)
         except Exception as e:
             print(f"[WARN] Calculation agent failed for segment {ev.segment_index}: {e}")
 
         try:
+            _t0 = time.perf_counter()
             statement_assurance_findings.extend(
                 run_statement_assurance_agent(llm, ev, catalog=catalog)
             )
+            _timer.record("statement_assurance", time.perf_counter() - _t0)
         except Exception as e:
             print(f"[WARN] Statement assurance agent failed for segment {ev.segment_index}: {e}")
 
@@ -5716,12 +6389,15 @@ def check_document(
     # Agent 5: runs once on full document — after segment loop
     segments = [ev.segment_text for ev in evidences]
     try:
+        _t0 = time.perf_counter()
         hypothesis_findings = run_hypothesis_agent(llm, doc_text, segments, catalog)
+        _timer.record("hypothesis", time.perf_counter() - _t0)
     except Exception as e:
         print(f"[WARN] Hypothesis agent failed: {e}")
 
     # Agent 6: runs once on full document — checks document-wide consistency against Agent 0 reference facts
     try:
+        _t0 = time.perf_counter()
         reference_consistency_findings = run_reference_consistency_agent(
             llm,
             doc_text,
@@ -5729,6 +6405,7 @@ def check_document(
             reference_facts,
             catalog,
         )
+        _timer.record("reference_consistency", time.perf_counter() - _t0)
     except Exception as e:
         print(f"[WARN] Reference consistency agent failed: {e}")
 
@@ -5753,6 +6430,8 @@ def check_document(
             output_path=Path(args.save_predictions_jsonl),
             catalog=catalog,
         )
+
+    _timer.print_summary(n_segments=len(evidences))
 
     print("\n" + "=" * 90)
     print(f"ERROR DETECTION REPORT — {doc_path.name}")
@@ -5936,10 +6615,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     started_at = datetime.now()
     t0 = time.perf_counter()
+    _log_path: Optional[Path] = None
     print(f"[INFO] Script start: {started_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
     try:
         args = parse_args()
+
+        # ── Set up run log (tees all print() output to logs/) ─────────────────
+        _log_model = getattr(args, "llm_model", None) or env_str("LLM_MODEL", "unknown")
+        _log_path  = _setup_run_logging(
+            case_id    = getattr(args, "case_id", "") or "",
+            model_name = _log_model,
+        )
+
         catalog = load_taxonomy_json(Path(args.taxonomy_json).resolve())
         print(
             f"[INFO] Loaded taxonomy: {len(catalog.main_classes)} Hauptklassen | "
@@ -5975,6 +6663,7 @@ def main() -> None:
         embed_model, embed_tok = load_hf_model(args.embed_model, device)
 
         llm = make_llm_client()
+        args.query_expander = make_query_expander()
 
         vision_cfg: Optional[dict] = None
         vision_model_enabled = env_bool("VISION_MODEL_ENABLED", True)
@@ -6042,6 +6731,7 @@ def main() -> None:
         elapsed_h = elapsed_s / 3600.0
         print(f"[INFO] Script end:   {ended_at.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"[INFO] Total runtime: {elapsed_s:.1f} s | {elapsed_min:.1f} min | {elapsed_h:.2f} h")
+        _teardown_run_logging(_log_path)
 
 
 if __name__ == "__main__":

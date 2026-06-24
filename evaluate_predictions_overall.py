@@ -6,17 +6,17 @@ Aggregierte Evaluation über alle Cases mit identischem Output wie evaluate_pred
 
 Aufruf:
     # Synthetische GT, alle Cases, Modell aus Dateinamen:
-    python evaluate_all_cases.py \
+    python evaluate_predictions_overall.py \
         --gt_dir    ./ground_truth \
         --pred_dir  ./predictions \
-        --model_tag qwen2.5-32b-instruct-q4_K_M \
+        --model_tag qwen2.5-72b-instruct-q4_K_M \
         --cases 01 02 03 04 05 07 08 \
         --gt_suffix synthetic \
         --output_dir ./eval_results/aggregated_qwen32b \
         --min_span_score 0.10
 
     # Manuelle GT (Case 06):
-    python evaluate_all_cases.py \
+    python evaluate_predictions_overall.py \
         --gt_dir    ./ground_truth \
         --pred_dir  ./predictions \
         --cases 06 \
@@ -223,6 +223,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--cases", nargs="+",
         default=["01", "02", "03", "04", "05", "07", "08"],
+       #default=["01", "02"],
         help="Case-Nummern (z.B. 01 02 03). Default: 01-05 07 08 (ohne 06)",
     )
     ap.add_argument("--gt_suffix",   default="synthetic",
