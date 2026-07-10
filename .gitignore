@@ -45,5 +45,6 @@ out/
 *.doc
 *.docx
 *.txt
+!requirements.txt
 *.md
 *.rtf
