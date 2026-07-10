@@ -1,0 +1,21 @@
+services:
+  gui:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    extra_hosts:
+      # Ollama stays native on the Spark host, not containerized —
+      # host.docker.internal resolves to the host from inside the container.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./cases:/app/cases
+      - ./eval_results:/app/eval_results
+      - ./reference_facts:/app/reference_facts
+      - ./image_cache:/app/image_cache
+      # RAG artefacts, rewritten by gui.py's "Rebuild rules" action
+      # (importDocuments_structural.py + embed_e5.py) and rag_append_case.py.
+      - ./artefacts:/app/artefacts
+    restart: unless-stopped

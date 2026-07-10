@@ -1,0 +1,67 @@
+{
+  "case_id": "case_06",
+  "facts": {
+    "auftraggeber": {
+      "value": "Staatsanwaltschaft Schwyz, 5. Abteilung",
+      "source_span": "Staatsanwaltschaft Schwyz // 5. Abteilung",
+      "confidence": "high"
+    },
+    "gutachten_titel": {
+      "value": "Auswertung einer Videoaufnahme bezüglich Geschwindigkeit sowie 3D-Visualisierung der Sichtverhältnisse des Fahrzeuglenkers",
+      "source_span": "Auswertung einer Videoaufnahme bezüglich Geschwindigkeit sowie 3D-Visualisierung der Sichtverhältnisse des Fahrzeuglenkers",
+      "confidence": "high"
+    },
+    "vorfall": {
+      "value": "Kollision zwischen einem Motorkarren und zwei Fussgängern",
+      "source_span": "Kollison zwischen einem Motorkarren und zwei Fussgängern",
+      "confidence": "high"
+    },
+    "beschuldigte_person": {
+      "value": "Joel Gerber, 16.09.2006, Beschuldigte Person, als Lenker des Motorkarrens SZ 86070, Wacker Neuson A",
+      "source_span": "Gerber Joel, 16.09.2006 Beschuldigt als Lenker des Motorkarrens SZ 86070, Wacker Neuson A",
+      "confidence": "high"
+    },
+    "ort": {
+      "value": "8853 Lachen SZ, Seestrasse, Verzweigung mit Äussere Haab",
+      "source_span": "8853 Lachen SZ, Seestrasse, Verzweigung mit Äussere Haab",
+      "confidence": "high"
+    },
+    "sachverstaendige_person": {
+      "value": "Andreas Leu, Unfälle/Technik",
+      "source_span": "Sachverständige Person | Andreas Leu, Unfälle/Technik",
+      "confidence": "high"
+    },
+    "hauptsachbearbeitung": {
+      "value": "Christophorus Widmer, Unfälle/Technik",
+      "source_span": "Hauptsachbearbeitung | Christophorus Widmer, Unfälle/Technik",
+      "confidence": "high"
+    },
+    "personen": [
+      {
+        "name": "Viviane Quadri",
+        "rolle": "JUGAin MLaw",
+        "source_span": "Frau JUGAin MLaw Viviane Quadri",
+        "confidence": "high"
+      },
+      {
+        "name": "Joel Gerber",
+        "rolle": "Beschuldigte Person, als Lenker des Motorkarrens SZ 86070, Wacker Neuson A",
+        "source_span": "Gerber Joel, 16.09.2006 Beschuldigt als Lenker des Motorkarrens SZ 86070, Wacker Neuson A",
+        "confidence": "high"
+      },
+      {
+        "name": "Andreas Leu",
+        "rolle": "Sachverständige Person, Unfälle/Technik",
+        "source_span": "Sachverständige Person | Andreas Leu, Unfälle/Technik",
+        "confidence": "high"
+      },
+      {
+        "name": "Christophorus Widmer",
+        "rolle": "Hauptsachbearbeitung, Unfälle/Technik",
+        "source_span": "Hauptsachbearbeitung | Christophorus Widmer, Unfälle/Technik",
+        "confidence": "high"
+      }
+    ],
+    "referenz_entitaeten": []
+  }
+}

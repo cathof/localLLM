@@ -1,0 +1,121 @@
+{
+  "version": "2.0.0",
+  "description": "Minimale Taxonomie, abgeleitet ausschliesslich aus belegten Ground-Truth-Findings (Case 06, 28 Findings). Nur Einträge, die mindestens einmal als gold_finding auftreten.",
+  "main_classes": [
+    {
+      "id": "RECHT",
+      "label": "Rechtskonformität",
+      "subclasses": [
+        {
+          "id": "RECHT_ABSICHERUNG",
+          "label": "Aussageabsicherung",
+          "description": "Aussagen sind zu absolut oder nicht abgesichert",
+          "gt_count": 4
+        },
+        {
+          "id": "RECHT_TRENNUNG",
+          "label": "Trennung Befund/Bewertung",
+          "description": "Interpretation wird als Tatsache dargestellt",
+          "gt_count": 1
+        }
+      ]
+    },
+    {
+      "id": "STRUKT",
+      "label": "Struktur und Argumentation",
+      "subclasses": [
+        {
+          "id": "STRUKT_BEFUND_BESCHREIBUNG",
+          "label": "Beschreibung von Befunden",
+          "description": "Sachverhalt unpräzise beschrieben",
+          "gt_count": 10
+        }
+      ]
+    },
+    {
+      "id": "FORMALES",
+      "label": "Formales",
+      "subclasses": [
+        {
+          "id": "FORMALES_REDAKTION",
+          "label": "Redaktionelle Korrektur",
+          "description": "sprachliche Fehler ohne Einfluss auf Inhalt",
+          "gt_count": 8
+        }
+      ]
+    },
+    {
+      "id": "RECHENFEHLER",
+      "label": "Rechenfehler",
+      "subclasses": [
+        {
+          "id": "RECHEN_ARITHMETIK",
+          "label": "Arithmetischer Fehler",
+          "description": "Falsches Rechenergebnis durch Rechen- oder Umrechnungsfehler",
+          "gt_count": 4
+        }
+      ]
+    },
+    {
+      "id": "HYPOTHESEN",
+      "label": "Hypothesenprüfung",
+      "subclasses": [
+        {
+          "id": "HYPO_INKONSISTENZ",
+          "label": "Inkonsistente Hypothesenbewertung",
+          "description": "Gleiche Befunde führen zu widersprüchlichen Schlussfolgerungen bei verschiedenen Hypothesen oder Befundbewertung widerspricht der zugehörigen Hypothese direkt",
+          "gt_count": 1
+        }
+      ]
+    }
+  ],
+  "change_types": [
+    {
+      "id": "CHANGE_REDAKTION",
+      "label": "Redaktionelle Korrektur",
+      "description": "sprachliche oder formale Verbesserung",
+      "gt_count": 8
+    },
+    {
+      "id": "CHANGE_FACHLICH",
+      "label": "Fachliche Präzisierung",
+      "description": "genauere Beschreibung eines Sachverhalts",
+      "gt_count": 14
+    },
+    {
+      "id": "CHANGE_ARGUMENTATION",
+      "label": "Erweiterung der Argumentation",
+      "description": "ausführlichere Begründung",
+      "gt_count": 1
+    },
+    {
+      "id": "CHANGE_RECHNERISCH",
+      "label": "Rechnerische Korrektur",
+      "description": "Korrektur eines falschen Zahlenwerts oder einer Berechnung",
+      "gt_count": 4
+    },
+    {
+      "id": "CHANGE_HYPOTHESE",
+      "label": "Hypothesen-Korrektur",
+      "description": "Korrektur einer Inkonsistenz zwischen Hypothese und Befundbewertung",
+      "gt_count": 1
+    }
+  ],
+  "severity_levels": [
+    {
+      "id": "LOW",
+      "label": "niedrig",
+      "gt_count": 8
+    },
+    {
+      "id": "MEDIUM",
+      "label": "mittel",
+      "gt_count": 14
+    },
+    {
+      "id": "HIGH",
+      "label": "hoch",
+      "gt_count": 6
+    }
+  ]
+}

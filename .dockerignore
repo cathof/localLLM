@@ -1,0 +1,15 @@
+.venv/
+venv/
+data/
+data_unused/
+cases/
+eval_results/
+image_cache/
+artefacts/
+.cache/
+__pycache__/
+*.pyc
+.git/
+.idea/
+*.iml
+*.log
