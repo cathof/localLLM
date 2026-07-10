@@ -70,7 +70,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 try:
-    from rag_answer_reference_facts_fp_hoch import (
+    from rag_answer_reference_facts import (
         load_dotenv, env_str, env_int, env_bool,
         require_env, env_json_object_optional,
         load_taxonomy_json, ErrorCatalog,

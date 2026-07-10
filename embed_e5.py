@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Embed a prepared JSONL file using intfloat/multilingual-e5-large via PyTorch.
+
+Reads a JSONL where each row has {"id", "text", "metadata"}, prefixes each
+text with "passage: " (E5 convention), mean-pools the encoder output, and
+L2-normalises the resulting vectors.  Writes a compressed NPZ (ids +
+embeddings) and a parallel index JSONL that stores the metadata for retrieval.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple
 from transformers import logging as hf_logging
-hf_logging.set_verbosity_error()
+hf_logging.set_verbosity_error()  # suppress HuggingFace info/warning noise
 
 import numpy as np
 import torch
@@ -75,6 +83,13 @@ def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 
 
 def choose_device(name: str) -> torch.device:
+    """Resolve a device string to a torch.device, with graceful fallback.
+
+    Accepts "auto" | "cuda" | "mps" | "metal" | "cpu".  For "auto" (and any
+    unrecognised value) the priority is CUDA → MPS → CPU.  If the requested
+    accelerator is unavailable the function silently falls back to CPU rather
+    than raising an error.
+    """
     n = (name or "auto").lower().strip()
 
     if n == "cpu":
@@ -84,7 +99,7 @@ def choose_device(name: str) -> torch.device:
     if n == "cuda":
         return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    # auto
+    # auto: prefer GPU accelerators if present
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -134,10 +149,17 @@ def embed_e5_passages(
         device: torch.device,
         max_length: int,
 ) -> np.ndarray:
-    """
-    E5 convention for indexing docs: prefix each chunk with 'passage: '.
-    We mean-pool last_hidden_state with attention mask and L2-normalize.
-    Returns float32 numpy array [B, D].
+    """Embed a batch of passage texts using the E5 retrieval convention.
+
+    E5 models require "passage: " to be prepended to every document chunk at
+    index time.  At query time the symmetric prefix is "query: ".  Skipping the
+    prefix degrades retrieval quality significantly.
+
+    Pooling: we compute an attention-mask-weighted mean over the token dimension
+    of last_hidden_state (standard approach for E5) instead of using the [CLS]
+    token.  The result is L2-normalised so that dot-product == cosine similarity.
+
+    Returns a float32 numpy array of shape [B, D].
     """
     prefixed = ["passage: " + t for t in texts]
 
@@ -156,6 +178,7 @@ def embed_e5_passages(
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden = out.last_hidden_state  # [B, T, D]
 
+        # Expand mask to match hidden dim so padding tokens contribute zero.
         mask = attention_mask.unsqueeze(-1).type_as(last_hidden)  # [B, T, 1]
         summed = (last_hidden * mask).sum(dim=1)                  # [B, D]
         counts = mask.sum(dim=1).clamp(min=1e-9)                  # [B, 1]
@@ -263,9 +286,9 @@ def embed_jsonl(cfg: EmbedConfig) -> Tuple[int, int, int]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Embed prepared.jsonl with multilingual-e5 via PyTorch (MPS/CUDA/CPU).")
 
-    ap.add_argument("--in", dest="input_jsonl", type=str, default=env_str("EMBED_INPUT", "prepared_rules.jsonl"))
-    ap.add_argument("--out_npz", type=str, default=env_str("EMBED_OUT_NPZ", "embeddings_rules.npz"))
-    ap.add_argument("--out_index", type=str, default=env_str("EMBED_OUT_INDEX", "index_rules.jsonl"))
+    ap.add_argument("--in", dest="input_jsonl", type=str, default=env_str("EMBED_INPUT", "artefacts/prepared_rules.jsonl"))
+    ap.add_argument("--out_npz", type=str, default=env_str("EMBED_OUT_NPZ", "artefacts/embeddings_rules.npz"))
+    ap.add_argument("--out_index", type=str, default=env_str("EMBED_OUT_INDEX", "artefacts/index_rules.jsonl"))
 
     ap.add_argument("--model", type=str, default=env_str("EMBED_MODEL", "intfloat/multilingual-e5-large-instruct"))
     ap.add_argument("--device", type=str, default=env_str("EMBED_DEVICE", "auto"))

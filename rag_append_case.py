@@ -278,9 +278,9 @@ def parse_args() -> argparse.Namespace:
     # Defaults: from .env if set, otherwise the usual convention
     ap.add_argument("--cases_dir", default=imp.CASES_DIR_DEFAULT or "./cases")
 
-    ap.add_argument("--out_jsonl", default=_env_str("OUT_JSONL2", "prepared_materials.jsonl"))
-    ap.add_argument("--out_npz", default=_env_str("EMBED_OUT_NPZ2", "embeddings_materials.npz"))
-    ap.add_argument("--out_index", default=_env_str("EMBED_OUT_INDEX2", "index_materials.jsonl"))
+    ap.add_argument("--out_jsonl", default=_env_str("OUT_JSONL2", "artefacts/prepared_materials.jsonl"))
+    ap.add_argument("--out_npz", default=_env_str("EMBED_OUT_NPZ2", "artefacts/embeddings_materials.npz"))
+    ap.add_argument("--out_index", default=_env_str("EMBED_OUT_INDEX2", "artefacts/index_materials.jsonl"))
 
     ap.add_argument("--delta_dir", default="./.delta_ingest", help="where delta artifacts are written")
     ap.add_argument("--keep_delta", action="store_true", help="do not delete delta artifacts")

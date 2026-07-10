@@ -30,11 +30,7 @@ Thumbs.db
 
 # --- Logs / outputs ---
 *.log
-prepared_materials.jsonl
-prepared_rules.jsonl
-embeddings_rules.npz
-embeddings_materials.npz
-embeddings.npz
+artefacts/
 *.jsonl
 .cache/
 .cache/**

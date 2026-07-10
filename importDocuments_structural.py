@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+Document ingestion pipeline: read → normalise → section-split →
+structural-unit split → semantic chunking → JSONL output.
+
+Supported formats: PDF (PyMuPDF + pdfplumber), DOCX (python-docx),
+PPTX (LibreOffice headless → PDF), plain text, Markdown.
+
+Each output record is a ChunkRecord with a stable content-addressed ID,
+chunk text, and rich metadata (case_id, document_type, chunk_index, …).
+The JSONL is consumed by embed_e5.py to build the retrieval store.
+"""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
+# Suppress verbose startup messages from ML libraries.
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -85,6 +97,11 @@ SUPPORTED_EXTS = {".pdf", ".docx", ".txt", ".md", ".pptx"}
 # ── .env loader ───────────────────────────────────────────────────────────────
 
 def load_dotenv(dotenv_path: str | Path = ".env") -> None:
+    """Parse KEY=VALUE pairs from a .env file into the process environment.
+
+    Uses os.environ.setdefault so that values already present in the
+    environment (e.g. set by the shell or CI) are never overwritten.
+    """
     p = Path(dotenv_path)
     if not p.exists():
         return
@@ -131,7 +148,7 @@ load_dotenv(".env")
 
 DATA_DIR_DEFAULT = env_str("DATA_DIR", "./data")
 CASES_DIR_DEFAULT = env_str("CASES_DIR", "")
-OUT_JSONL_DEFAULT = env_str("OUT_JSONL", "prepared_rules.jsonl")
+OUT_JSONL_DEFAULT = env_str("OUT_JSONL", "artefacts/prepared_rules.jsonl")
 IMAGE_CACHE_DIR_DEFAULT = env_str("IMAGE_CACHE_DIR", "./image_cache")
 
 CHUNK_SIZE_TOKENS_DEFAULT = env_int("CHUNK_SIZE_TOKENS", 320)
@@ -299,6 +316,12 @@ def stable_chunk_id(
         chunk_index: int,
         chunk_text: str,
 ) -> str:
+    """Return a content-addressed ID for a chunk.
+
+    The ID combines the file hash, relative path, chunk index, and a hash of
+    the chunk text itself.  This means re-running ingestion on an unchanged
+    file produces the same IDs, enabling safe deduplication in rag_append_case.
+    """
     payload = (
         f"{file_hash}|{rel_path}|{chunk_index}"
         f"|{sha256_hex(chunk_text.encode('utf-8', errors='replace'))}"
@@ -364,6 +387,14 @@ _SOFT_LINEBREAK_WORD_RE = re.compile(r"([A-Za-zÄÖÜäöüß])\n([A-Za-zÄÖÜ�
 
 
 def normalize_text(text: str) -> str:
+    """Clean raw extracted text for downstream chunking.
+
+    Handles common PDF extraction artefacts:
+    - Hyphenated line-breaks ("Unter-\\nsuchung" \u2192 "Untersuchung")
+    - Soft line-breaks inside words where a line ended mid-word
+    - Non-breaking and narrow no-break spaces \u2192 regular space
+    Trailing/leading whitespace and runs of 3+ newlines are also collapsed.
+    """
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -392,6 +423,13 @@ class TokenCounter:
         self._init_backend()
 
     def _init_backend(self) -> None:
+        """Select the best available tokenizer backend.
+
+        Priority: tiktoken (fast, BPE) → transformers AutoTokenizer (accurate
+        for any HuggingFace model) → simple word/punctuation regex fallback.
+        The fallback is intentionally lenient: it never raises and gives a
+        reasonable word count so chunking still works without ML dependencies.
+        """
         if self.backend in {"auto", "tiktoken"} and tiktoken is not None:
             try:
                 self._encoder = (
@@ -449,6 +487,13 @@ class SemanticEncoder:
             self.available = False
 
     def encode(self, texts: list[str]) -> Optional[list[list[float]]]:
+        """Return L2-normalised embeddings for a list of texts, or None on error.
+
+        Embeddings are normalised by the sentence-transformers library so that
+        cosine_similarity() reduces to a plain dot product.  Returns None when
+        the model is unavailable, which causes the caller to skip semantic
+        splitting and fall back to token-budget chunking only.
+        """
         if not self.available or self._model is None or not texts:
             return None
         try:
@@ -464,6 +509,11 @@ class SemanticEncoder:
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Pure-Python cosine similarity for pre-normalised float lists.
+
+    Used when numpy is not available.  For normalised vectors the result
+    equals the dot product, but the full formula is kept for safety.
+    """
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = na = nb = 0.0
@@ -514,6 +564,12 @@ def _classify_paragraph_style(style_name: str) -> tuple[str, int]:
 
 
 def looks_like_header(line: str) -> tuple[bool, int, str]:
+    """Heuristically decide whether a line is a section heading.
+
+    Checks in order: Markdown #-prefix, section keyword prefix, numeric
+    outline pattern (1.2.3), and finally an uppercase-ratio / title-case test
+    for short all-caps lines.  Returns (is_header, level, title_text).
+    """
     s = line.strip()
     if not s:
         return False, 0, ""
@@ -657,6 +713,13 @@ def split_into_sentences(text: str) -> list[str]:
 
 
 def split_section_into_structural_units(section: Section) -> list[StructuralUnit]:
+    """Break a section body into typed structural units (paragraph, list, heading).
+
+    Uses a stateful flush pattern: content lines accumulate in current_lines until
+    a boundary is detected (sub-header, list start, blank-line between kinds).
+    List items are consumed greedily with a lookahead loop so multi-line bullet
+    blocks are kept together in a single unit rather than split at each newline.
+    """
     raw_lines = [ln.rstrip() for ln in section.body.split("\n")]
     units: list[StructuralUnit] = []
 

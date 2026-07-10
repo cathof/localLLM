@@ -99,12 +99,12 @@ for CASE in "${CASES[@]}"; do
         --document "$DOC" \
         --case_id "case_${CASE}" \
         --taxonomy_json "$TAX" \
-        --embeddings embeddings_rules.npz \
-        --index index_rules.jsonl \
-        --prepared prepared_rules.jsonl \
-        --embeddings2 embeddings_materials.npz \
-        --index2 index_materials.jsonl \
-        --prepared2 prepared_materials.jsonl \
+        --embeddings artefacts/embeddings_rules.npz \
+        --index artefacts/index_rules.jsonl \
+        --prepared artefacts/prepared_rules.jsonl \
+        --embeddings2 artefacts/embeddings_materials.npz \
+        --index2 artefacts/index_materials.jsonl \
+        --prepared2 artefacts/prepared_materials.jsonl \
         --save_predictions_jsonl "$PRED" \
         --print_sources \
         --print_context \

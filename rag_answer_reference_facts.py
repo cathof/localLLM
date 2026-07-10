@@ -514,7 +514,7 @@ def _looks_like_upper_surname(token: str) -> bool:
 
 
 def _normalize_header_person_name(raw_name: str) -> str:
-    """Normalize header notation like 'GERBER Joel' to 'Joel GERBER'."""
+    """Normalize header notation like 'MUSTER Hans' to 'Hans MUSTER'."""
     parts = [p for p in re.split(r"\s+", (raw_name or "").strip()) if p]
     if len(parts) >= 2 and _looks_like_upper_surname(parts[0]):
         surname = parts[0]
@@ -724,8 +724,8 @@ def build_reference_facts_messages(
         "  oder Versanddatum. Nur extrahieren wenn explizit als Vorfall-/Tatdatum erkennbar.\n"
         "  Bei mehreren Daten: dasjenige wählen das semantisch zum Vorfall gehört.\n"
         "- beschuldigte_person: Wenn im Kopf ein Tabellenfeld 'Person' steht, ist dies die\n"
-        "  beschuldigte Person. Beispiel: 'Person GERBER Joel, 16.09.2006 Beschuldigt als Lenker'\n"
-        "  → value = 'Joel GERBER, 16.09.2006, Beschuldigte Person, als Lenker'.\n"
+        "  beschuldigte Person. Beispiel: 'Person MUSTER Hans, 15.07.2012 Beschuldigt als Fahrer'\n"
+        "  → value = 'Hans MUSTER, 15.07.2012 Beschuldigte Person, als Fahrer'.\n"
         "- personen: Liste aller im Dokumentkopf genannten relevanten Personen mit Rolle.\n\n"
         "Gib exakt dieses JSON-Objekt zurück:\n"
         "{\n"
@@ -1711,7 +1711,10 @@ class LLMQueryExpander:
                 f"Anfrage:\n{base}\n\nErzeuge genau {n_rewrites} alternative Umformulierungen."},
         ]
         try:
-            raw = self.llm.chat(messages, json_mode=True, schema=self._SCHEMA)
+            import json as _json
+            _dbg_payload = {"model": self.llm.model, "format": "json", "think": self.llm.disable_think, "options": self.llm.options}
+            print(f"[QUERY-EXPAND-DEBUG] payload-meta: {_json.dumps(_dbg_payload, ensure_ascii=False)}")
+            raw = self.llm.chat(messages, json_mode=True)
             rewrites = [
                 _normalize_query_text(q)
                 for q in json.loads(raw).get("queries", [])
@@ -2713,6 +2716,159 @@ def _dedup_evidenz_across_segments(
 ) -> List[Dict[str, Any]]:
     """Veraltet -- delegiert an _dedup_spans_across_segments."""
     return _dedup_spans_across_segments(findings)
+
+
+# ── Agent-2 Scope-Guard: Referenzfakten-Spans nicht fachlich prüfen ───────────
+def _normalize_reference_scope_text(text: str) -> str:
+    """
+    Normalisiert Text für robuste Span-Vergleiche zwischen Agent-0-source_span
+    und Agent-2-stelle_im_segment.
+
+    Zweck: Tabellenlinearisierungen wie "Person | Name, 16.09.2006" sollen
+    auch dann erkannt werden, wenn Pipe, Komma oder Whitespace leicht anders
+    ausfallen. Die Funktion wird nur für Scope-Entscheide verwendet, nicht zur
+    inhaltlichen Gleichsetzung von Referenzfakten.
+    """
+    s = str(text or "")
+    s = s.replace("|", " ")
+    s = re.sub(r"[^0-9A-Za-zÄÖÜäöüß]+", " ", s, flags=re.UNICODE)
+    return " ".join(s.lower().split())
+
+
+def _is_high_or_medium_confidence(value: Any) -> bool:
+    return str(value or "low").strip().lower() in {"high", "medium"}
+
+
+def collect_protected_reference_spans(reference_facts: Dict[str, Any]) -> List[str]:
+    """
+    Sammelt source_span-Stellen aus Agent 0, die nicht von Agent 2 geprüft
+    werden sollen.
+
+    Rollenabgrenzung:
+    - Agent 0 extrahiert Referenzfakten aus Dokumentkopf/Metadaten.
+    - Agent 2 prüft fachliche Gutachtentexte, aber keine Agent-0-source_spans.
+    - Agent 6 prüft spätere dokumentweite Widersprüche gegen Referenzfakten.
+
+    Deshalb werden nur source_span-Felder mit confidence high/medium geschützt.
+    Values/Aliases werden absichtlich nicht pauschal geschützt, damit echte
+    spätere Widersprüche im Fliesstext weiterhin von Agent 6 gefunden werden.
+    """
+    spans: List[str] = []
+    seen: Set[str] = set()
+
+    def add_span(span: Any, confidence: Any) -> None:
+        if not _is_high_or_medium_confidence(confidence):
+            return
+        raw = " ".join(str(span or "").split()).strip()
+        if not raw:
+            return
+        key = _normalize_reference_scope_text(raw)
+        # Ein einzelnes Wort ist zu breit als Schutzbereich; Datums-/Personenfelder
+        # haben nach Normalisierung typischerweise mehrere Tokens.
+        if len(key.split()) < 2:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        spans.append(raw)
+
+    facts = reference_facts.get("facts", {}) if isinstance(reference_facts, dict) else {}
+    if not isinstance(facts, dict):
+        return spans
+
+    for _key, fact in facts.items():
+        if isinstance(fact, dict):
+            add_span(fact.get("source_span"), fact.get("confidence"))
+        elif isinstance(fact, list):
+            for item in fact:
+                if isinstance(item, dict):
+                    add_span(item.get("source_span"), item.get("confidence"))
+
+    return spans
+
+
+def is_on_protected_reference_span(
+        finding: Dict[str, Any],
+        protected_reference_spans: Sequence[str],
+) -> bool:
+    """
+    True, wenn Agent 2 ein Finding auf einer Agent-0-source_span-Stelle meldet.
+
+    Verglichen wird robust:
+    - exakte normalisierte Gleichheit
+    - Finding-Span ist Teil des protected source_span
+    - protected source_span ist Teil des Finding-Spans
+    - Token-Containment bei leicht abweichender Interpunktion
+    """
+    if not protected_reference_spans:
+        return False
+
+    span = str(
+        finding.get("stelle_im_segment")
+        or finding.get("span_text")
+        or ""
+    ).strip()
+    if not span:
+        return False
+
+    span_norm = _normalize_reference_scope_text(span)
+    span_tokens = span_norm.split()
+    if len(span_tokens) < 2:
+        return False
+
+    for ref in protected_reference_spans:
+        ref_norm = _normalize_reference_scope_text(ref)
+        if not ref_norm:
+            continue
+
+        if span_norm == ref_norm or span_norm in ref_norm or ref_norm in span_norm:
+            return True
+
+        ref_tokens = set(ref_norm.split())
+        if ref_tokens:
+            overlap = sum(1 for tok in span_tokens if tok in ref_tokens) / len(span_tokens)
+            # 0.80 fängt Fälle wie "Person | Nachname, Vorname 16.09.2006"
+            # vs. "Person | Nachname Vorname, 16.09.2006 Beschuldigt als Lenker" ab.
+            if overlap >= 0.80:
+                return True
+
+    return False
+
+
+def filter_factual_findings_on_protected_reference_spans(
+        findings: List[Dict[str, Any]],
+        protected_reference_spans: Sequence[str],
+        *,
+        segment_index: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Entfernt Agent-2-Findings, deren stelle_im_segment auf einen von Agent 0
+    validierten source_span fällt. Das ist ein Scope-Filter, kein semantischer
+    Korrekturfilter: Referenzfakten werden von Agent 0/Agent 6 behandelt, nicht
+    vom Fachprüfer.
+    """
+    if not findings or not protected_reference_spans:
+        return findings
+
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for f in findings:
+        if is_on_protected_reference_span(f, protected_reference_spans):
+            dropped += 1
+            print(
+                f"[SCOPE-DROP] S{segment_index or f.get('segment_index') or '?'} "
+                f"Factual-Finding auf Agent-0-Referenzspan verworfen: "
+                f"{str(f.get('stelle_im_segment') or '')[:100]!r}"
+            )
+            continue
+        kept.append(f)
+
+    if dropped:
+        print(
+            f"[SCOPE-FILTER] S{segment_index or '?'}: "
+            f"{dropped} Factual-Finding(s) auf Referenzfakten-source_span verworfen"
+        )
+    return kept
 
 # ── Agent 2 (Ergänzung): Keyword-Guard Zweifel ───────────────────────────────
 ZWEIFEL_VERBOTEN = [
@@ -6225,6 +6381,12 @@ def check_document(
     )
     _timer.record("agent0", time.perf_counter() - _t0)
     reference_facts_context = format_reference_facts_for_prompt(reference_facts)
+    protected_reference_spans = collect_protected_reference_spans(reference_facts)
+    if protected_reference_spans:
+        print(
+            f"[INFO] Agent-2 Scope-Guard aktiv: "
+            f"{len(protected_reference_spans)} Referenzfakten-source_span(s) geschützt"
+        )
 
     if args.print_reference_facts:
         print("\n" + "=" * 90)
@@ -6352,8 +6514,18 @@ def check_document(
     for ev in evidences:
         try:
             _t0 = time.perf_counter()
+            raw_factual_findings = run_factual_agent(
+                llm,
+                ev,
+                per_agent_context_chars=per_agent_context_chars,
+                catalog=catalog,
+            )
             factual_findings.extend(
-                run_factual_agent(llm, ev, per_agent_context_chars=per_agent_context_chars, catalog=catalog)
+                filter_factual_findings_on_protected_reference_spans(
+                    raw_factual_findings,
+                    protected_reference_spans,
+                    segment_index=ev.segment_index,
+                )
             )
             _timer.record("factual", time.perf_counter() - _t0)
         except Exception as e:
