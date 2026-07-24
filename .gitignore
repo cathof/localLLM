@@ -1,10 +1,28 @@
 # --- data (exclude all input documents) ---
-data/
-data/**
 data_unused/
 data_unused/**
-cases/
-cases/**
+
+# --- artefact/output directories: keep folder in git, ignore contents ---
+case_documents/*
+!case_documents/.gitkeep
+cases/*
+!cases/.gitkeep
+data/*
+!data/.gitkeep
+eval_results/*
+!eval_results/.gitkeep
+ground_truth/*
+!ground_truth/.gitkeep
+image_cache/*
+!image_cache/.gitkeep
+injection/*
+!injection/.gitkeep
+logs/*
+!logs/.gitkeep
+predictions/*
+!predictions/.gitkeep
+reports/*
+!reports/.gitkeep
 
 # --- Python ---
 __pycache__/
@@ -30,7 +48,8 @@ Thumbs.db
 
 # --- Logs / outputs ---
 *.log
-artefacts/
+artefacts/*
+!artefacts/.gitkeep
 *.jsonl
 .cache/
 .cache/**
