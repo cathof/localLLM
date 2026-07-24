@@ -5,11 +5,17 @@ FROM python:3.14-slim
 # libreoffice: soffice --headless, used by importDocuments_structural.py:pptx_to_pdf()
 # poppler-utils: pdf2image (tests/test_read_faultypdf.py)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    python3-dev \
     tesseract-ocr \
     tesseract-ocr-deu \
+    tesseract-ocr-eng \
     default-jre-headless \
     libreoffice \
     poppler-utils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
